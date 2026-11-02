@@ -551,6 +551,15 @@ fn stop(game: &mut Game<'_>, session: Session) {
     RADIUS.set(0);
 }
 
+/// End workers while Windows threads are still alive. A thread-local Session
+/// left to process teardown can otherwise join workers after ExitProcess has
+/// terminated them, producing std's unexpected-thread-termination panic.
+pub(super) fn shutdown(game: &mut Game<'_>) {
+    if let Some(session) = SESSION.take() {
+        stop(game, session);
+    }
+}
+
 /// Once a frame (`native_frame`).
 pub(super) fn frame(game: &mut Game<'_>) {
     if !game.native_window() {

@@ -32,6 +32,11 @@ Changes by dormyu:
   already supplies cell centres, so no second half-stride offset is added.
 - `tools/horizon.py`: allow an explicit `HORIZON_MIXINS_BIN` for the combined
   Immersive Landscapes native set. The pinned default remains available.
+- `shutdown.rs` / `bridge.rs`: stop the thread-local DH engine at the beginning
+  of `Game::shut_down`, while worker threads and the renderer still exist. On
+  Windows, leaving it until process/thread-local destruction caused joins after
+  ExitProcess had terminated workers. Manually disabling DH before exit avoided
+  the observed failure; the explicit lifecycle hook is verified separately.
 
 Validation so far: 16 core tests passed on Windows, including recovery tests;
 the full optimized `fast` Horizon client and control tool built successfully.
@@ -59,6 +64,13 @@ license texts, and access to its corresponding modified source.
 was tested at near16/32 with DH128 medium. At the reviewed mountain pose DH
 reported288/288 sections, no queued jobs. This is a scene observation, not proof
 that all far-water/material seams are fixed. The engine's far shortcut and close
-water rendering still have known discrepancies. Flight frame-time spikes and
-Windows process-exit failures remain open; high static average FPS is not
-smoothness acceptance. The rejected4sections/1MiB upload limit is not a default.
+water rendering still have known discrepancies. Flight frame-time spikes remain
+open; high static average FPS is not smoothness acceptance. The rejected
+4sections/1MiB upload limit is not a default.
+
+The shutdown hook's combined binary built in8m36. A persisted solo IL world
+with DH128, plus two Rust clients with DH64 on a fresh Rust server, all exited
+with code0; server exit was also0. The clients received far geometry and the
+same emerald-block update, with zero chunk decode errors. Their short network
+run did not settle every far section; it does not prove complete steady-state
+far rendering or heavy-pack performance.

@@ -42,6 +42,15 @@ bindings = [
 ]
 
 [[injection]]
+id = "shutdown"
+kind = "HEAD"
+target = "horizon_client::game::Game<'_>::shut_down"
+helper = "shutdown.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
+
+[[injection]]
 id = "fog"
 kind = "HEAD"
 target = "horizon_client::game::native_hooks::Game<'_>::native_render_fog"
