@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build Distant Horizons for Horizon Client into Horizon, test it there, package it.
+r"""Build Distant Horizons for Horizon Client into Horizon, test it there, package it.
 
     python3 tools/horizon.py stage      # apply the bundle on the pinned Horizon: target/stage/
     python3 tools/horizon.py check      # ... and cargo check the game
@@ -83,7 +83,7 @@ def tool():
     """horizon-mixins at the pinned commit, built once."""
     rev = COMPAT["horizon_mixins_revision"]
     root = TARGET / "horizon-mixins" / rev
-    binary = root / "bin" / "horizon-mixins"
+    binary = root / "bin" / ("horizon-mixins.exe" if os.name == "nt" else "horizon-mixins")
     if not binary.is_file():
         log(f"Building horizon-mixins {rev[:7]}")
         subprocess.run(["cargo", "install", "--locked", "--quiet", "--git", COMPAT["horizon_mixins_repository"],
@@ -154,7 +154,16 @@ def stage(horizon, extra=()):
                    check=True, stdout=subprocess.DEVNULL)
     out = TARGET / "stage"
     out.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["rsync", "-a", "--checksum", "--delete", f"{fresh}/", f"{out}/"], check=True)
+    # Native Windows does not ship rsync. Keep unchanged file mtimes for Cargo.
+    for old in sorted(out.rglob("*"), reverse=True):
+        if old.is_file() and not (fresh / old.relative_to(out)).exists():
+            old.unlink()
+    for src in fresh.rglob("*"):
+        dst = out / src.relative_to(fresh)
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+        elif not dst.exists() or src.read_bytes() != dst.read_bytes():
+            shutil.copy2(src, dst)
     shutil.rmtree(fresh)
     log(f"Staged {out}")
     return out
@@ -199,6 +208,9 @@ def bundle_files():
     # No `hooks`: the mod reads more than the native hook points, so the launcher must build it on the commit it
     # pins, not on whichever Horizon the player has.
     files = {"horizon-native.json": (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()}
+    # Carry the upstream licenses and modification notice with the source bundle.
+    for name in ("LICENSE", "COPYING.GPL", "ADAPTATION.md", "compatibility.json"):
+        files[name] = (ROOT / name).read_bytes()
     for path in sorted(BUNDLE.iterdir()):
         if path.suffix in (".rs", ".toml"):
             files[f"mixins/{ID}/{path.name}"] = path.read_bytes()

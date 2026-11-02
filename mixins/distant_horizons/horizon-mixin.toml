@@ -7,7 +7,7 @@ priority = 100
 # reads Horizon's chunks, world generator and renderer, and widens
 # `terrain_distance`: it is pinned to this commit.
 [compatibility]
-horizon_revision = "d009ebd140476b5bdc958c00f56a75e82abec691"
+horizon_revision = "c9d474dd9116e84c243f8992d75c11314df56f06"
 
 # The Distant Horizons core, Horizon-free (also the Cargo library).
 [[module]]
@@ -70,6 +70,16 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "mod_id", ty = "&str", value = "mod_id" },
   { name = "button", ty = "usize", value = "button" },
+]
+
+[[injection]]
+id = "chat_tree"
+kind = "RETURN"
+target = "horizon_client::game::chat::Game<'_>::chat_tree_for"
+helper = "chat_tree.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "value", ty = "horizon_client::command::Dispatcher", value = "$value" },
 ]
 
 [[injection]]

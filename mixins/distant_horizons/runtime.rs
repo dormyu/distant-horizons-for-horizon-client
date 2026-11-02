@@ -845,6 +845,13 @@ pub struct SampledRun {
 /// The world generator, as far terrain samples it: one column at a time,
 /// without generating chunks. Runs come from the bottom up; gaps are air.
 pub trait ColumnSampler: Send {
+    /// Begin a bounded sampling batch at this section's data spacing.
+    fn begin_section(&mut self, _stride: i32) {}
+    /// False means unavailable, not air (e.g. a refused server tile).
+    fn try_column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) -> bool {
+        self.column(x, z, out);
+        true
+    }
     fn column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>);
 }
 
@@ -860,6 +867,7 @@ pub fn generate_missing(
 ) -> usize {
     let width = pos::data_width(source.pos);
     let (base_x, base_z) = (pos::min_corner_block_x(source.pos), pos::min_corner_block_z(source.pos));
+    sampler.begin_section(width);
     let mut runs = Vec::new();
     let mut filled = 0;
     for x in 0..pos::WIDTH {
@@ -868,11 +876,13 @@ pub fn generate_missing(
                 continue;
             }
             runs.clear();
-            sampler.column(
+            if !sampler.try_column(
                 base_x + x * width + width / 2,
                 base_z + z * width + width / 2,
                 &mut runs,
-            );
+            ) {
+                continue;
+            }
             let column = column_from_runs(&mut source.mapping, &runs, min_build, max_build);
             source.set_column(x, z, column, gen_step::SURFACE);
             filled += 1;
@@ -2040,6 +2050,8 @@ pub mod engine {
         near: Mutex<Arc<Near>>,
         settings: Mutex<WorkSettings>,
         done: Mutex<Vec<Meshed<H::Mesh>>>,
+        /// Missing server data is retried with backoff, even while standing still.
+        retry: Mutex<HashMap<i64, Instant>>,
         stop: AtomicBool,
         generated: AtomicUsize,
         /// Each meshed section's face count.
@@ -2102,6 +2114,7 @@ pub mod engine {
                 near: Mutex::new(Arc::new(Near::default())),
                 settings: Mutex::new(settings),
                 done: Mutex::new(Vec::new()),
+                retry: Mutex::new(HashMap::new()),
                 stop: AtomicBool::new(false),
                 generated: AtomicUsize::new(0),
                 chunks: AtomicUsize::new(0),
@@ -2192,6 +2205,22 @@ pub mod engine {
                 self.last_save = now;
                 push(&self.shared, Job::Save, i64::MAX);
             }
+            if self.shared.settings.lock().unwrap().generation {
+                let mut retry = self.shared.retry.lock().unwrap();
+                retry.retain(|s, _| self.wanted.contains(s));
+                let mut due: Vec<_> = retry
+                    .iter()
+                    .filter(|(_, at)| **at <= now)
+                    .map(|(&s, &at)| (s, at))
+                    .collect();
+                due.sort_unstable_by_key(|&(s, at)| (at, s));
+                // Bound retries per frame; permanent refusals cannot monopolize
+                // the queue because retry times move forward after each attempt.
+                for (s, _) in due.into_iter().take(4) {
+                    retry.remove(&s);
+                    push(&self.shared, Job::Section(s), 0);
+                }
+            }
             let done = std::mem::take(&mut *self.shared.done.lock().unwrap());
             let mut meshes = Vec::with_capacity(done.len());
             for m in done {
@@ -2209,7 +2238,8 @@ pub mod engine {
             }
             // A retiring section goes once every wanted section over it has
             // its mesh in (or has nothing to draw): no holes meanwhile.
-            let ready = |s: &i64| self.shown.contains(s) || self.blank.contains(s);
+            let retry = self.shared.retry.lock().unwrap();
+            let ready = |s: &i64| !retry.contains_key(s) && (self.shown.contains(s) || self.blank.contains(s));
             let removed: Vec<i64> = self
                 .retiring
                 .iter()
@@ -2427,6 +2457,22 @@ pub mod engine {
                     if shared.wanted.lock().unwrap().contains(&s) {
                         prepare(shared, s, generator);
                         mesh(shared, s);
+                        let missing = shared
+                            .store
+                            .lock()
+                            .unwrap()
+                            .sections
+                            .get(&s)
+                            .is_none_or(|data| data.missing_columns() > 0);
+                        if settings.generation && missing {
+                            shared
+                                .retry
+                                .lock()
+                                .unwrap()
+                                .insert(s, Instant::now() + Duration::from_secs(2));
+                        } else {
+                            shared.retry.lock().unwrap().remove(&s);
+                        }
                     }
                     shared.queue.lock().unwrap().sections.remove(&s);
                 }
@@ -3136,6 +3182,107 @@ mod tests {
         }
         fn mesh(&self, _: i64, _: &FullDataSource, quads: &[Quad], _: bool) -> usize {
             quads.len()
+        }
+    }
+
+    #[test]
+    fn refused_columns_remain_missing_and_can_be_recovered() {
+        struct Gate(bool);
+        impl ColumnSampler for Gate {
+            fn column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) {
+                FakeSampler.column(x, z, out);
+            }
+            fn try_column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) -> bool {
+                if !self.0 {
+                    return false;
+                }
+                self.column(x, z, out);
+                true
+            }
+        }
+        let mut source = FullDataSource::empty(pos::encode(6, -1, -1));
+        let count = source.missing_columns();
+        assert!(count > 0);
+        let mut gate = Gate(false);
+        assert_eq!(generate_missing(&mut source, &mut gate, -64, 2032), 0);
+        assert_eq!(source.missing_columns(), count);
+        gate.0 = true;
+        assert_eq!(generate_missing(&mut source, &mut gate, -64, 2032), count);
+        assert_eq!(source.missing_columns(), 0);
+    }
+
+    #[test]
+    fn stationary_player_recovers_after_server_refusal() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct RecoveringHost {
+            inner: FakeHost,
+            ready: Arc<AtomicBool>,
+        }
+        struct RecoveringSampler(Arc<AtomicBool>);
+        impl ColumnSampler for RecoveringSampler {
+            fn column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) {
+                FakeSampler.column(x, z, out);
+            }
+            fn try_column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) -> bool {
+                if !self.0.load(Ordering::Relaxed) {
+                    return false;
+                }
+                self.column(x, z, out);
+                true
+            }
+        }
+        impl Host for RecoveringHost {
+            type Mesh = usize;
+            fn blocks(&self) -> &BlockTable {
+                self.inner.blocks()
+            }
+            fn build_height(&self) -> (i32, i32) {
+                (-64, 320)
+            }
+            fn sampler(&self) -> Option<Box<dyn ColumnSampler>> {
+                Some(Box::new(RecoveringSampler(self.ready.clone())))
+            }
+            fn mesh(&self, _: i64, _: &FullDataSource, quads: &[Quad], _: bool) -> usize {
+                quads.len()
+            }
+        }
+        let ready = Arc::new(AtomicBool::new(false));
+        let settings = engine::WorkSettings {
+            render: RenderSettings {
+                cave_culling: false,
+                cave_culling_height: 60,
+                min_y: -64,
+            },
+            generation: true,
+            debug: false,
+        };
+        let host = RecoveringHost {
+            inner: FakeHost { blocks: blocks() },
+            ready: ready.clone(),
+        };
+        let mut e = engine::Engine::new(host, None, 1, settings, 1);
+        let plan = DetailPlan::new(HorizontalQuality::Low, 8);
+        let start = std::time::Instant::now();
+        let mut released = false;
+        loop {
+            e.update([-8.0, -8.0], plan, engine::Near::default());
+            let stats = e.stats();
+            if !released && stats.wanted > 0 && stats.queued == 0 {
+                assert_eq!(stats.shown, 0);
+                ready.store(true, Ordering::Relaxed);
+                released = true;
+            }
+            if released && stats.shown == stats.wanted && stats.wanted > 0 {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(20),
+                "server data never recovered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
