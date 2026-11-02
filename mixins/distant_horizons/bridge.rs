@@ -141,11 +141,10 @@ impl ChunkView for LoadedChunk {
 }
 
 /// Horizon's far-terrain sampler of the world generator.
-// dormyu adaptation: batch the native server protocol's 16x16 tiles.
+// dormyu adaptation: batch local and server sampling with matching footprints.
 // RemoteSampler.column() is intentionally empty; its grid() is the network API.
 struct Sampler {
     inner: Box<dyn LodSampler>,
-    remote: bool,
     stride: i32,
     tiles: HashMap<(i32, i32), Vec<horizon_client::lod::Column>>,
 }
@@ -168,7 +167,6 @@ impl ColumnSampler for Sampler {
         Self::runs(&self.inner.column(x, z), out);
     }
     fn try_column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) -> bool {
-        if !self.remote { self.column(x, z, out); return true; }
         let tile_size = self.stride * 16;
         let tx = x.div_euclid(tile_size) * tile_size;
         let tz = z.div_euclid(tile_size) * tile_size;
@@ -204,7 +202,6 @@ struct Style {
 
 struct HorizonHost {
     layout: ColumnLayout,
-    remote_source: bool,
     context: Arc<WorkerContext>,
     blocks: BlockTable,
     /// The world generator, once the game has one to give.
@@ -312,7 +309,7 @@ impl Host for HorizonHost {
     }
     fn sampler(&self) -> Option<Box<dyn ColumnSampler>> {
         let source = self.source.lock().unwrap().clone()?;
-        Some(Box::new(Sampler { inner: LodSource::sampler(source), remote: self.remote_source, stride: 1, tiles: HashMap::new() }))
+        Some(Box::new(Sampler { inner: LodSource::sampler(source), stride: 1, tiles: HashMap::new() }))
     }
     fn mesh(&self, section: i64, source: &FullDataSource, quads: &[Quad], debug: bool) -> SectionMesh {
         let mut mesh = SectionMesh::default();
@@ -514,7 +511,6 @@ fn start(game: &mut Game<'_>, key: WorldKey, settings: &Settings) -> Session {
     });
     let host = HorizonHost {
         layout: game.world.layout(),
-        remote_source: key.remote,
         context: game.pack.context.clone(),
         blocks,
         source: Mutex::new(source),
@@ -675,6 +671,17 @@ fn scan_chunks(game: &mut Game<'_>, session: &mut Session) {
 /// while a session runs.
 pub(super) fn terrain_distance(value: i32) -> i32 {
     value.max(RADIUS.get())
+}
+
+pub(super) fn render_fog(game: &Game<'_>, kind: horizon_client::fog::FogType, fog: &mut horizon_client::fog::FogData) {
+    if RADIUS.get() > 0 && game.dim.id() == "minecraft:overworld"
+        && kind == horizon_client::fog::FogType::Atmospheric
+        && game.potions.effects.get("blindness").is_none()
+        && game.potions.effects.get("darkness").is_none()
+    {
+        (fog.environmental_start, fog.environmental_end) = dh::distant_atmosphere(
+            RADIUS.get(), fog.environmental_start, fog.environmental_end);
+    }
 }
 
 /// `tree` with `/dh` and its words (`distant_horizons::COMMANDS`), for the

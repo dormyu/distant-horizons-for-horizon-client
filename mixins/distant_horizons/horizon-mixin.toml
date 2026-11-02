@@ -42,6 +42,17 @@ bindings = [
 ]
 
 [[injection]]
+id = "fog"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_render_fog"
+helper = "fog.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "self" },
+  { name = "fog_type", ty = "horizon_client::fog::FogType", value = "fog_type" },
+  { name = "fog", ty = "&mut horizon_client::fog::FogData", value = "&mut *fog" },
+]
+
+[[injection]]
 id = "list"
 kind = "HEAD"
 target = "horizon_client::game::native_hooks::Game<'_>::native_mods"

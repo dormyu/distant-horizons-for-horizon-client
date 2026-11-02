@@ -81,6 +81,11 @@ def source(horizon):
 
 def tool():
     """horizon-mixins at the pinned commit, built once."""
+    if override := os.environ.get("HORIZON_MIXINS_BIN"):
+        binary = Path(override).resolve()
+        if not binary.is_file():
+            sys.exit(f"HORIZON_MIXINS_BIN does not exist: {binary}")
+        return binary
     rev = COMPAT["horizon_mixins_revision"]
     root = TARGET / "horizon-mixins" / rev
     binary = root / "bin" / ("horizon-mixins.exe" if os.name == "nt" else "horizon-mixins")

@@ -25,6 +25,13 @@ Changes by dormyu:
   retry with a two-second backoff and a bounded queue even for a stationary player.
   Added tests for temporary refusals and recovery.
 - `compatibility.json`: pin the engine used by this adaptation.
+- `fog.rs` / `runtime.rs`: extend the terrain fog range to the active DH range,
+  while preserving fluid/effect fog. Regression coverage brings core tests to17.
+- `bridge.rs`: local sampling now uses the same16-by16 footprint grid requests
+  as remote sampling. The native API receives tile origins; the DH runtime
+  already supplies cell centres, so no second half-stride offset is added.
+- `tools/horizon.py`: allow an explicit `HORIZON_MIXINS_BIN` for the combined
+  Immersive Landscapes native set. The pinned default remains available.
 
 Validation so far: 16 core tests passed on Windows, including recovery tests;
 the full optimized `fast` Horizon client and control tool built successfully.
@@ -47,3 +54,11 @@ under the world's `data/DistantHorizons` directory.
 No compiled game resources, user accounts or worlds should be published. Any
 redistributed modified native bundle must preserve these notes, the original
 license texts, and access to its corresponding modified source.
+
+2026-11-02 combined candidate0.2.0-dev.1: full Epic-based native world generation
+was tested at near16/32 with DH128 medium. At the reviewed mountain pose DH
+reported288/288 sections, no queued jobs. This is a scene observation, not proof
+that all far-water/material seams are fixed. The engine's far shortcut and close
+water rendering still have known discrepancies. Flight frame-time spikes and
+Windows process-exit failures remain open; high static average FPS is not
+smoothness acceptance. The rejected4sections/1MiB upload limit is not a default.

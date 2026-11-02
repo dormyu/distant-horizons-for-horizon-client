@@ -21,6 +21,29 @@ pub const NAME: &str = "Distant Horizons";
 pub const VERSION: &str = "0.1.0";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
+/// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
+/// LOD is active. DH owns that view instead; extend only that default range.
+pub fn distant_atmosphere(radius_chunks: i32, start: f32, end: f32) -> (f32, f32) {
+    if (1023.9..=1024.1).contains(&end) {
+        let scale = (radius_chunks as f32 * 16.0 / 1024.0).max(1.0);
+        (start * scale, end * scale)
+    } else {
+        (start, end)
+    }
+}
+
+#[cfg(test)]
+mod atmosphere_tests {
+    #[test]
+    fn distant_mountains_remain_visible_and_special_fog_keeps_its_range() {
+        assert_eq!(super::distant_atmosphere(256, 256.0, 1024.0), (1024.0, 4096.0));
+        assert_eq!(super::distant_atmosphere(64, 256.0, 1024.0), (256.0, 1024.0));
+        assert_eq!(super::distant_atmosphere(256, 0.0, 96.0), (0.0, 96.0));
+        assert_eq!(super::distant_atmosphere(256, 0.0, 512.0), (0.0, 512.0));
+        assert_eq!(super::distant_atmosphere(256, 1e9, 2e9), (1e9, 2e9));
+    }
+}
+
 /// `DhSectionPos`: a quadtree node, packed in a long as Distant Horizons
 /// does (detail level in bits 0-7, x in 8-35, z in 36-63). A section at
 /// detail level `d` is `2^d` blocks wide and holds 64 x 64 data columns of
