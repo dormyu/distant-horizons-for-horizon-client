@@ -1,0 +1,54 @@
+diff --git a/crates/horizon-mixins-cli/tests/cases/boundary.rs b/crates/horizon-mixins-cli/tests/cases/boundary.rs
+index 57cd58a..a954456 100644
+--- a/crates/horizon-mixins-cli/tests/cases/boundary.rs
++++ b/crates/horizon-mixins-cli/tests/cases/boundary.rs
+@@ -67,6 +67,37 @@ source="runtime.rs"
+     );
+     f
+ }
++#[test]
++fn crate_recursion_limit_preserves_ordered_head_callbacks() {
++    let f = fixture();
++    let path = f.root.join("engine/src/lib.rs");
++    let original = fs::read_to_string(&path).unwrap();
++    fs::write(&path, format!("#![recursion_limit = \"256\"]\n{original}")).unwrap();
++    let original = source::files(&f.root).unwrap();
++    let report = f.run("check");
++    assert!(
++        report["cargo_stdout"]
++            .as_str()
++            .unwrap()
++            .contains("preserved_closure_errors_and_drop ... ok")
++    );
++    assert_eq!(original, source::files(&f.root).unwrap());
++    assert!(
++        fs::read_to_string(f.out.join("engine/src/lib.rs"))
++            .unwrap()
++            .contains("recursion_limit = \"256\"")
++    );
++    f.replace(
++        "engine/src/boundary.rs",
++        "pub fn run(",
++        "#[unexpanded::attribute]\npub fn run(",
++    );
++    assert_eq!(
++        build_plan(&f.root, &f.mods).unwrap_err().code,
++        "E_UNSUPPORTED_MACRO"
++    );
++}
++
+ #[test]
+ fn head_preserves_lifetime_methods_closures_question_mark_and_drop() {
+     let f = fixture();
+diff --git a/crates/horizon-mixins-core/src/index.rs b/crates/horizon-mixins-core/src/index.rs
+index 1c6ab00..e4bd0e9 100644
+--- a/crates/horizon-mixins-core/src/index.rs
++++ b/crates/horizon-mixins-core/src/index.rs
+@@ -104,6 +104,7 @@ pub fn macro_attributes(attrs: &[Attribute]) -> bool {
+                 | "must_use"
+                 | "deprecated"
+                 | "track_caller"
++                | "recursion_limit"
+         )
+     })
+ }

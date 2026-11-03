@@ -100,7 +100,7 @@ fn fingerprint(facts: &horizon_client::blocks::BlockFacts) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     // Old generated previews used a single column for the whole footprint.
     // Rebuild derived LOD files; gameplay chunks and player edits stay intact.
-    "dormyu-area-sampling-refinement-v1".hash(&mut h);
+    "dormyu-area-sampling-refinement-v1-f42ef42".hash(&mut h);
     for s in &facts.states {
         s.name.hash(&mut h);
     }

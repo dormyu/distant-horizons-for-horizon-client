@@ -67,8 +67,28 @@ contributors. Original copyright notices, LICENSE and COPYING.GPL remain intact.
 The code retains **LGPL-3.0-only**. It is separate from the MIT-licensed original
 Immersive Landscapes generator.
 
-Target Horizon: `c9d474dd9116e84c243f8992d75c11314df56f06` (Minecraft 26.3).
-Mixins tool: `0d6b103c70633d8fd9443d8d0acd3aadaacedb06`.
+Current compatibility candidate: `0.1.0+dormyu.3`, Horizon
+`f42ef42ef6ceccb3c6a20bea2481d87949a51c81` (Minecraft 26.3).
+Mixins tool: `ddd9700b21997c95d95ac6ee5ecafe3830cf622a` plus the inert
+`recursion_limit` attribute fix, tested local tool commit `d4af4d8`.
+Set `HORIZON_MIXINS_BIN` to that patched tool. Its source patch and MIT notice
+are included separately. The unpatched tool cannot index this Nightly.
+
+The preceding delivered `dormyu.2` build on c9d474d adds footprint reduction,
+bounded local feature refinement and worker-side cache eviction. Its core has
+18 passing tests. Three short warm-cache flights at near16/DH128 medium gave
+109–111FPS averages and maximum frames26/36/45ms. This does not establish cold
+world, near32/120, multiplayer load or final visual acceptance. Gray coarse
+cliffs and water/material boundaries remain. Raising all LOD quality was not
+adopted: the diagnostic's peak private commit reached about5.2GiB.
+
+The f42 compatibility candidate also fingerprints generated caches by engine,
+accepts a SHA256-verified local official source archive for the build, and
+builds `horizon-ctl` from its new `horizon-client-lib` package. Generation and
+rendering changes above are retained. Validation of this candidate is in progress.
+
+The following initial adaptation notes and measurements are historical c9d474d
+evidence; they do not establish f42 compatibility.
 
 Changes by dormyu:
 

@@ -60,6 +60,16 @@ def source(horizon):
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
             tar.extractall(partial, filter="data")
         top = partial
+    elif local_archive := os.environ.get("HORIZON_SOURCE_ARCHIVE"):
+        archive = Path(local_archive).resolve()
+        with archive.open("rb") as stream:
+            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+        if actual != COMPAT.get("horizon_source_archive_sha256"):
+            sys.exit("Local Horizon source archive does not match the pinned release SHA256")
+        log(f"Using verified local Horizon source archive {revision[:7]}")
+        with tarfile.open(archive) as tar:
+            tar.extractall(partial, filter="data")
+        top = next(partial.iterdir())
     else:
         log(f"Downloading Horizon {revision[:7]}")
         url = f"https://codeload.github.com/horizon-rust/horizon/tar.gz/{revision}"
@@ -181,6 +191,8 @@ def cargo(stage_dir, action):
     else:
         command += ["--bin", "horizon-client"]
     if action == "build":
+        if (stage_dir / "crates/horizon-client-lib/Cargo.toml").is_file():
+            command += ["-p", "horizon-client-lib"]
         command += ["--bin", "horizon-ctl", "--profile", "fast"]
     # The WebAssembly mods' runtime, when this Horizon still has it: the launcher builds with it.
     features = tomllib.loads((stage_dir / "crates/horizon-client/Cargo.toml").read_text()).get("features", {})
@@ -214,7 +226,8 @@ def bundle_files():
     # pins, not on whichever Horizon the player has.
     files = {"horizon-native.json": (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()}
     # Carry the upstream licenses and modification notice with the source bundle.
-    for name in ("LICENSE", "COPYING.GPL", "ADAPTATION.md", "compatibility.json"):
+    for name in ("LICENSE", "COPYING.GPL", "ADAPTATION.md", "compatibility.json",
+                 "tools/patches/horizon-mixins-f42-compat.patch", "third-party/horizon-mixins-LICENSE"):
         files[name] = (ROOT / name).read_bytes()
     for path in sorted(BUNDLE.iterdir()):
         if path.suffix in (".rs", ".toml"):
