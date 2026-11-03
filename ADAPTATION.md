@@ -25,10 +25,27 @@ foliage. It is not an upstream release or an accepted final renderer.
 The new stationary-refinement test and17 existing core tests passed; core Clippy
 passed with warnings denied, including after the cache-eviction correction.
 The first combined engine compiled and rendered the reported camera, but a221ms
-flight outlier was observed. It is not a passed smoothness check. The correction
-is being rebuilt and requires repeated flights before installation.
-Same-camera inspection, frame measurements, persistence and two-client results
-are recorded in the lab manifest only after the corresponding checks finish.
+flight outlier was observed. The second build moves cache eviction off the game
+thread. Three subsequent12-second flights on a copied warm-cache QA world had
+maximum frame times26.20/36.35/44.70ms, averages110.56/109.08/109.45FPS and
+P99 frame times18.56/20.56/19.69ms. Static average116.04FPS, P99 9.08ms.
+Conditions:1080p offscreen, near16/simulation8/DH128 medium, cap120, VSync/audio
+off, no competing Dota2 process at preflight. Each flight resets to its start,
+so the measurement includes teleport/load work. This is a short diagnostic,
+not visible-gameplay, near32/120, heavy-pack or long-exploration acceptance.
+
+Final-binary light checks passed for RU/EN named world creation, exact recipes,
+solo block persistence, disabled generator and an unchanged oldv4 recipe copy.
+Two native clients on a loopback Rust server received49 chunks each, a shared
+emerald-block update and DH geometry, with zero decode errors and all three
+processes exiting0. Their short near2/cap15 run is not far-loading/performance
+acceptance. The network reporter initially omitted its binary hash; the report
+explicitly identifies its later comparison against the frozen candidate hash.
+
+Same-camera images improve the distant forest, but coarse gray stepped faces
+and far-water/material boundaries remain. This is a partial correction. No
+renderer/landscape quality acceptance is claimed. Installed Prism readback and
+delivery hashes are recorded separately in the lab manifest after they finish.
 
 Limits: full decoration refinement uses the local native sampler in solo/LAN
 host. The remote sampler's current API supplies grid previews and saved chunks;
