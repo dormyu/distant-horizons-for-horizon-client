@@ -1,5 +1,27 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Water-volume correction —0.1.0+dormyu.5
+
+Horizon f42ef42, built codeabae49b, combined runtime `c30f2439`.
+Water/lava of the same fluid material no longer produce interior side walls
+solely because their biome/color mapping IDs differ. Top colors remain distinct.
+Ignored submerged vegetation does not split a contiguous water run; real air
+gaps remain. Kelp/seagrass states project as their contained water volume in the
+native bridge. The default fluid cache fingerprint advances to water-volume-v2,
+rebuilding derived LODs only; ordinary blocks and generator recipes are retained.
+
+Both new regressions fail on the previous code; all20 core tests now pass.
+Offline locked Clippy passes with warnings denied. Same-world water captures
+at30/60/90s, named generation/save checks, two Rust clients and independent
+Zoom input checks pass. Short near32/DH128 Medium1080p offscreen diagnostic:
+119.76FPS static, 118.39FPS flight, flight max20.59ms.
+These targeted checks are not zero-seam, all-seed, long-exploration or heavy-pack
+acceptance. Fractional fluid-level/material transitions remain under observation.
+Actual installed Prism verification is recorded in native-build.json after delivery.
+Upstream Deniz Şahin and original DH James Seibel/contributors credits and
+LGPL-3.0-only/COPYING.GPL notices are retained. Historical adaptations follow.
+
+
 ## Rendering correction candidate — 2026-11-03
 
 Local version `0.1.0+dormyu.2` addresses reported stepped cliffs and floating
