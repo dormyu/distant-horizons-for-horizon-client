@@ -270,8 +270,7 @@ Original authors and LGPL-3.0-only notices are retained in the source bundle.
 
 
 def release_zip(hnmod):
-    """target/distant-horizons-for-horizon-client-<version>.zip: the .hnmod with the installer (both names keep
-    their execute bit) and INSTALL.txt, for players."""
+    """Package the source bundle and adaptation instructions without unverified installers."""
     out = TARGET / f"distant-horizons-for-horizon-client-{VERSION}.zip"
     files = [(hnmod.name, hnmod.read_bytes(), 0o644),
              ("INSTALL.txt", INSTALL_TXT.format(version=VERSION).encode(), 0o644)]
@@ -351,7 +350,7 @@ def main():
     if args.action == "stage":
         print(staged)
     elif args.action == "build":
-        print(cargo(staged, "build") / "horizon-client")
+        print(cargo(staged, "build") / ("horizon-client.exe" if os.name == "nt" else "horizon-client"))
     else:
         cargo(staged, args.action)
 

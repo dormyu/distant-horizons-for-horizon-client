@@ -729,9 +729,13 @@ fn stop(game: &mut Game<'_>, session: Session) {
         }
     }
     if let Some(renderer) = &mut game.renderer {
-        let removed: Vec<TileKey> = session.engine.shown_sections().map(tile).collect();
-        renderer.queue_lods(Vec::new(), removed, None);
-        renderer.upload_lods(UPLOAD_BUDGET);
+        // Queued removals only start the renderer's fade. No DH frame runs
+        // after shutdown to advance that fade or drain pending uploads.
+        // DH owns far terrain while native LOD is disabled: cancel pending
+        // uploads and release both visible and fading tiles immediately.
+        let shown = session.engine.shown_sections().count();
+        renderer.clear_lods();
+        log::debug!("Distant Horizons: cleared renderer ({shown} registered sections)");
     }
     drop(session);
     RADIUS.set(0);

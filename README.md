@@ -1,7 +1,10 @@
 # Distant Horizons for Horizon Client
 
-> This local checkout includes dormyu's `0.1.0+dormyu.2` adaptation for Horizon
-> c9d474d. See [ADAPTATION.md](ADAPTATION.md) for changes, attribution and limits.
+> This local checkout includes dormyu's `0.1.0+dormyu.4` adaptation for Horizon
+> f42ef42. See [ADAPTATION.md](ADAPTATION.md) for changes, attribution and limits.
+> This revision needs the bundled horizon-mixins tool patch and an explicit
+> `HORIZON_MIXINS_BIN`; the upstream automatic installers below are not verified
+> for this adaptation. Runtime checks of the compatibility candidate are pending.
 > The upstream README follows; this is not an upstream release.
 
 [Distant Horizons](https://gitlab.com/distant-horizons-team/distant-horizons)' level-of-detail terrain, ported to
