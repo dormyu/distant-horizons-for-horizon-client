@@ -187,7 +187,12 @@ def stage(horizon, extra=()):
 def cargo(stage_dir, action):
     command = ["cargo", action, "--locked", "-p", "horizon-client"]
     if action == "test":
-        command += ["--bin", "horizon-client", "--", "distant_horizons::tests"]
+        if (stage_dir / "crates/horizon-client/src/lib.rs").is_file():
+            # The executable is now a thin entry point; mod tests live in gameplay.
+            command += ["--lib"]
+        else:
+            command += ["--bin", "horizon-client"]
+        command += ["--", "distant_horizons::tests"]
     else:
         command += ["--bin", "horizon-client"]
     if action == "build":
