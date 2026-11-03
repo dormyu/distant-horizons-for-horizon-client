@@ -38,6 +38,15 @@ const REREAD_EVERY: Duration = Duration::from_secs(5);
 /// The far-terrain upload budget per frame, as Horizon's own far terrain.
 const UPLOAD_BUDGET: Duration = Duration::from_millis(2);
 
+// These plants contain water even though their block is non-colliding. Far
+// terrain projects the fluid volume; detailed near chunks keep the plant mesh.
+fn water_like(name: &str) -> bool {
+    matches!(
+        name.strip_prefix("minecraft:").unwrap_or(name),
+        "water" | "bubble_column" | "kelp" | "kelp_plant" | "seagrass" | "tall_seagrass"
+    )
+}
+
 /// What `BlockInfo` Horizon's block facts give each state.
 fn block_table(facts: &horizon_client::blocks::BlockFacts) -> BlockTable {
     let states = (0..facts.states.len())
@@ -46,7 +55,7 @@ fn block_table(facts: &horizon_client::blocks::BlockFacts) -> BlockTable {
             let f = facts.get(state);
             let name = f.name.strip_prefix("minecraft:").unwrap_or(&f.name);
             let air = facts.is_air(state);
-            let water = matches!(name, "water" | "bubble_column");
+            let water = water_like(name);
             let liquid = water || name == "lava";
             let ice = name == "ice" || name == "frosted_ice";
             let see_through = water || ice || name.contains("glass") || name == "slime_block" || name == "honey_block";
@@ -100,7 +109,7 @@ fn fingerprint(facts: &horizon_client::blocks::BlockFacts) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     // Old generated previews used a single column for the whole footprint.
     // Rebuild derived LOD files; gameplay chunks and player edits stay intact.
-    "dormyu-area-sampling-refinement-v1-f42ef42".hash(&mut h);
+    "dormyu-water-volume-v2-f42ef42".hash(&mut h);
     for s in &facts.states {
         s.name.hash(&mut h);
     }
@@ -382,10 +391,12 @@ impl HorizonHost {
             .registry
             .state(BlockStateId(state))
             .map_or("", |s| s.name.as_str());
-        let fluid = match name {
-            "minecraft:water" | "minecraft:bubble_column" => Some(("block/water_still", true)),
-            "minecraft:lava" => Some(("block/lava_still", false)),
-            _ => None,
+        let fluid = if water_like(name) {
+            Some(("block/water_still", true))
+        } else if name == "minecraft:lava" {
+            Some(("block/lava_still", false))
+        } else {
+            None
         };
         if let Some((sprite, water)) = fluid {
             let layer = render

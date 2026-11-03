@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.4";
+pub const VERSION: &str = "0.1.0+dormyu.5";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -1232,6 +1232,20 @@ pub fn render_column(full: &[u64], mapping: &IdMap, blocks: &BlockTable, setting
             }
         }
         if ignore {
+            // Kelp/seagrass occupy water, not an air gap. Once a column is
+            // underwater, skipped non-colliding vegetation extends that water
+            // until a real air run or a retained material ends it. Otherwise
+            // every plant adds translucent top/bottom faces inside the ocean.
+            if !info.air
+                && !air_after_last
+                && last_block.is_some_and(|last| last.material == material::WATER)
+                && last_bottom == top
+                && let Some(last) = out.points.last_mut()
+            {
+                *last = render_point::set_y_min(*last, bottom);
+                last_bottom = bottom;
+                continue;
+            }
             // Flowers and grass only pass on their light: with block textures
             // their colour on the ground below would draw them as a carpet.
             if info.alpha != 0 {
@@ -1440,7 +1454,10 @@ struct BoxAt {
 }
 
 fn is_same_transparent_block(p: u64, color: u32, material: u8) -> bool {
-    render_point::material(p) == material && render_point::color(p) == color
+    // State/biome mapping ids may change within one continuous fluid. Its
+    // exposed faces retain their own tint, but the shared interior has no wall.
+    render_point::material(p) == material
+        && (matches!(material, material::WATER | material::LAVA) || render_point::color(p) == color)
 }
 
 fn add_box(quads: &mut Vec<Quad>, at: BoxAt, p: u64, top: u64, bottom: u64, adj: [Option<&RenderColumn>; 4]) {
@@ -3044,6 +3061,104 @@ mod tests {
             .unwrap();
         assert_eq!(pos::detail_level(*nearest), 6);
         assert!(sections.iter().any(|&s| pos::detail_level(s) >= 9));
+    }
+
+    #[test]
+    fn water_volume_ignores_submerged_plant_gaps_but_keeps_real_air() {
+        let b = blocks();
+        let mut mapping = IdMap::default();
+        let [air, water, plant, stone] = [AIR, WATER, FLOWER, STONE].map(|s| mapping.add_if_not_present(1, s));
+        let settings = RenderSettings {
+            cave_culling: false,
+            cave_culling_height: 60,
+            min_y: -64,
+        };
+        let mut full = vec![
+            full_point::encode(air, 100, 132, 0, 15).unwrap(),
+            full_point::encode(water, 4, 128, 0, 15).unwrap(),
+            full_point::encode(plant, 1, 127, 0, 10).unwrap(),
+            full_point::encode(water, 15, 112, 0, 10).unwrap(),
+            full_point::encode(stone, 112, 0, 0, 0).unwrap(),
+        ];
+        let rendered = render_column(&full, &mapping, &b, &settings);
+        let fluids: Vec<_> = rendered
+            .points
+            .iter()
+            .copied()
+            .filter(|&p| render_point::is_fluid(p))
+            .collect();
+        assert_eq!(
+            fluids.len(),
+            1,
+            "Underwater plants must not add interior water surfaces"
+        );
+        assert_eq!(
+            (render_point::y_min(fluids[0]), render_point::y_max(fluids[0])),
+            (112, 132)
+        );
+        full[2] = full_point::encode(air, 1, 127, 0, 10).unwrap();
+        let rendered = render_column(&full, &mapping, &b, &settings);
+        assert_eq!(
+            rendered.points.iter().filter(|&&p| render_point::is_fluid(p)).count(),
+            2,
+            "An actual air pocket must remain open"
+        );
+    }
+
+    #[test]
+    fn water_volume_has_no_internal_walls_at_biome_boundaries() {
+        let b = blocks();
+        let mut full = FullDataSource::empty(pos::encode(6, 0, 0));
+        let air = full.mapping.add_if_not_present(1, AIR);
+        let water_a = full.mapping.add_if_not_present(1, WATER);
+        let water_b = full.mapping.add_if_not_present(2, WATER);
+        let stone = full.mapping.add_if_not_present(1, STONE);
+        for x in 0..pos::WIDTH {
+            for z in 0..pos::WIDTH {
+                full.set_column(
+                    x,
+                    z,
+                    vec![
+                        full_point::encode(air, 100, 132, 0, 15).unwrap(),
+                        full_point::encode(if x < 32 { water_a } else { water_b }, 20, 112, 0, 15).unwrap(),
+                        full_point::encode(stone, 112, 0, 0, 0).unwrap(),
+                    ],
+                    gen_step::LIGHT,
+                );
+            }
+        }
+        let settings = RenderSettings {
+            cave_culling: false,
+            cave_culling_height: 60,
+            min_y: -64,
+        };
+        let render = RenderSource::from_full(&full, &b, &settings);
+        let quads = build_quads(&render, [None; 4], &settings, |_, _| false);
+        assert!(
+            !quads.iter().any(|q| (q.dir == Dir::West || q.dir == Dir::East)
+                && q.plane == 32
+                && [water_a, water_b].contains(&q.id)),
+            "Tint changes must not create a translucent wall inside continuous water"
+        );
+        assert!(quads.iter().any(|q| q.dir == Dir::Up && q.id == water_a));
+        assert!(quads.iter().any(|q| q.dir == Dir::Up && q.id == water_b));
+        // A real edge against air still needs its water side face.
+        full.set_column(
+            32,
+            0,
+            vec![
+                full_point::encode(air, 120, 112, 0, 15).unwrap(),
+                full_point::encode(stone, 112, 0, 0, 0).unwrap(),
+            ],
+            gen_step::LIGHT,
+        );
+        let render = RenderSource::from_full(&full, &b, &settings);
+        let quads = build_quads(&render, [None; 4], &settings, |_, _| false);
+        assert!(
+            quads
+                .iter()
+                .any(|q| q.dir == Dir::East && q.plane == 32 && q.id == water_a)
+        );
     }
 
     #[test]
