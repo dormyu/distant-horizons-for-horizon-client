@@ -1,5 +1,48 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Rendering correction candidate — 2026-11-03
+
+Local version `0.1.0+dormyu.2` addresses reported stepped cliffs and floating
+foliage. It is not an upstream release or an accepted final renderer.
+
+- Coarse sampling reduces a 2-by-2 footprint using native majority occupancy,
+  rather than expanding a single rock/leaf sample over the whole cell.
+- One shared native decoration builder supplies actual feature-complete columns
+  around the player, bounded to the requested near ring and at most1024 blocks.
+  Native request/cache bounds and idle-priority workers remain in force.
+- Completed columns enter DH as FEATURES data; LIGHT data from gameplay chunks
+  retains precedence. The engine drains completed work while stationary, including
+  after a cached preview is reopened. Preview workers use independent forks.
+- A sampling fingerprint revision rebuilds derived LOD files. Gameplay chunks,
+  world-generator recipes and player edits are not migrated.
+- `/dh status` includes the number of refined section updates. Queued DH jobs
+  do not include every native decoration task; zero queued is not visual acceptance.
+- Cache eviction is a deduplicated worker job. Large section arrays are released
+  outside the store lock, rather than in the render thread's `replan` path.
+- Shared feature polling is limited to4Hz; unchanged view coordinates skip cache
+  pruning. Remote clients do not enqueue an unsupported full-feature protocol.
+
+The new stationary-refinement test and17 existing core tests passed; core Clippy
+passed with warnings denied, including after the cache-eviction correction.
+The first combined engine compiled and rendered the reported camera, but a221ms
+flight outlier was observed. It is not a passed smoothness check. The correction
+is being rebuilt and requires repeated flights before installation.
+Same-camera inspection, frame measurements, persistence and two-client results
+are recorded in the lab manifest only after the corresponding checks finish.
+
+Limits: full decoration refinement uses the local native sampler in solo/LAN
+host. The remote sampler's current API supplies grid previews and saved chunks;
+it has no full-decoration request method. Remote clients receive the footprint
+correction but do not gain a new feature-streaming protocol from this patch.
+Cold generation is more expensive; bounded request metadata is not a claim that
+the DH store is globally memory-bounded during unlimited exploration. Older-PC
+settings and a long exploration run still require profiling.
+
+The independent native Horizon far renderer is compared as another candidate.
+Voxy's current Fabric/OpenGL implementation is not bundled or copied.
+
+## Earlier adaptation and historical checks
+
 Started 2026-11-02. This is a modified version of **Distant Horizons for Horizon
 Client**, based on upstream commit `53e116bad8bbe55e3e4d76504af721f1260afb81` by
 Deniz Şahin and contributors. Original Distant Horizons: James Seibel and

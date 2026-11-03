@@ -1,5 +1,9 @@
 # Distant Horizons for Horizon Client
 
+> This local checkout includes dormyu's `0.1.0+dormyu.2` adaptation for Horizon
+> c9d474d. See [ADAPTATION.md](ADAPTATION.md) for changes, attribution and limits.
+> The upstream README follows; this is not an upstream release.
+
 [Distant Horizons](https://gitlab.com/distant-horizons-team/distant-horizons)' level-of-detail terrain, ported to
 Rust for the game client of [Horizon](https://github.com/horizon-rust/horizon), the Rust rewrite of Minecraft: Java
 Edition 26.3. It is a native mod: a [horizon-mixins](https://github.com/horizon-rust/horizon-mixins) bundle that the

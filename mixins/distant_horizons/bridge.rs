@@ -73,7 +73,13 @@ fn block_table(facts: &horizon_client::blocks::BlockFacts) -> BlockTable {
             let opaque = (f.solid_render || name.ends_with("_leaves")) && !see_through;
             BlockInfo {
                 air,
-                opacity: if air { 0 } else if opaque { 16 } else { f.dampening.min(15) },
+                opacity: if air {
+                    0
+                } else if opaque {
+                    16
+                } else {
+                    f.dampening.min(15)
+                },
                 // Chorus is thin, but a visible part of the far End.
                 solid: !air && (f.full_collision || name.starts_with("chorus_")),
                 liquid,
@@ -92,6 +98,9 @@ fn block_table(facts: &horizon_client::blocks::BlockFacts) -> BlockTable {
 fn fingerprint(facts: &horizon_client::blocks::BlockFacts) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Old generated previews used a single column for the whole footprint.
+    // Rebuild derived LOD files; gameplay chunks and player edits stay intact.
+    "dormyu-area-sampling-refinement-v1".hash(&mut h);
     for s in &facts.states {
         s.name.hash(&mut h);
     }
@@ -120,7 +129,9 @@ impl ChunkView for LoadedChunk {
     fn min_non_empty_height(&self) -> i32 {
         let air = self.air;
         let lowest = self.chunk.sections.iter().position(|s| !s.is_uniform(air));
-        lowest.map_or(self.chunk.layout().max_y(), |s| self.chunk.layout().min_y() + s as i32 * 16)
+        lowest.map_or(self.chunk.layout().max_y(), |s| {
+            self.chunk.layout().min_y() + s as i32 * 16
+        })
     }
     fn top(&self, x: i32, z: i32) -> i32 {
         let air = self.air;
@@ -129,7 +140,11 @@ impl ChunkView for LoadedChunk {
             .map_or(self.chunk.layout().min_y(), |y| y + 1)
     }
     fn state(&self, x: i32, y: i32, z: i32) -> u32 {
-        if (self.chunk.layout().min_y()..self.chunk.layout().max_y()).contains(&y) { self.chunk.get(x, y, z) } else { self.air }
+        if (self.chunk.layout().min_y()..self.chunk.layout().max_y()).contains(&y) {
+            self.chunk.get(x, y, z)
+        } else {
+            self.air
+        }
     }
     fn biome(&self, x: i32, y: i32, z: i32) -> u16 {
         self.chunk.biome(x, y, z)
@@ -147,36 +162,165 @@ struct Sampler {
     inner: Box<dyn LodSampler>,
     stride: i32,
     tiles: HashMap<(i32, i32), Vec<horizon_client::lod::Column>>,
+    refinement: Arc<Mutex<Refinement>>,
+    build_height: (i32, i32),
+}
+
+/// One shared native decoration builder, independent of the DH sampling workers.
+/// Its own queue/cache are bounded by Horizon; do not start one builder per tile.
+#[derive(Default)]
+struct Refinement {
+    enabled: bool,
+    sampler: Option<Box<dyn LodSampler>>,
+    pending: HashSet<(i32, i32)>,
+    completed: HashSet<(i32, i32)>,
+    center: [i32; 2],
+    near_radius: i32,
+    last_request: Option<Instant>,
+    last_poll: Option<Instant>,
+}
+
+impl Refinement {
+    fn wanted(&self, x: i32, z: i32) -> bool {
+        let dx = (x * 16 + 8 - self.center[0]).abs();
+        let dz = (z * 16 + 8 - self.center[1]).abs();
+        dx.max(dz) <= 1024 && dx.max(dz) >= self.near_radius * 16
+    }
+    fn request_tile(&mut self, x: i32, z: i32, stride: i32) {
+        if !self.enabled || stride > 4 {
+            return;
+        }
+        for cz in z.div_euclid(16)..(z + stride * 16).div_euclid(16) {
+            for cx in x.div_euclid(16)..(x + stride * 16).div_euclid(16) {
+                if self.wanted(cx, cz) && !self.completed.contains(&(cx, cz)) {
+                    self.pending.insert((cx, cz));
+                }
+            }
+        }
+    }
+    fn drain(&mut self, min_y: i32, max_y: i32) -> Vec<FullDataSource> {
+        if !self.enabled
+            || self
+                .last_poll
+                .is_some_and(|last| last.elapsed() < Duration::from_millis(250))
+        {
+            return Vec::new();
+        }
+        self.last_poll = Some(Instant::now());
+        let mut sections: HashMap<i64, FullDataSource> = HashMap::new();
+        let Some(sampler) = &mut self.sampler else {
+            return Vec::new();
+        };
+        for ((cx, cz), columns) in sampler.drain_details() {
+            self.pending.remove(&(cx, cz));
+            self.completed.insert((cx, cz));
+            let bx = cx * 16;
+            let bz = cz * 16;
+            let key = pos::containing_block(pos::SECTION_MINIMUM_DETAIL_LEVEL, bx, bz);
+            let source = sections.entry(key).or_insert_with(|| FullDataSource::empty(key));
+            let ox = bx - pos::min_corner_block_x(key);
+            let oz = bz - pos::min_corner_block_z(key);
+            let mut runs = Vec::new();
+            for z in 0..16 {
+                for x in 0..16 {
+                    runs.clear();
+                    Sampler::runs(&columns[z * 16 + x], &mut runs);
+                    let values = dh::column_from_runs(&mut source.mapping, &runs, min_y, max_y);
+                    source.set_column(ox + x as i32, oz + z as i32, values, dh::gen_step::FEATURES);
+                }
+            }
+        }
+        if self
+            .last_request
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        {
+            self.last_request = Some(Instant::now());
+            let mut wanted: Vec<_> = self.pending.iter().copied().collect();
+            wanted.sort_unstable_by_key(|&(x, z)| {
+                let dx = i64::from(x * 16 + 8 - self.center[0]);
+                let dz = i64::from(z * 16 + 8 - self.center[1]);
+                dx * dx + dz * dz
+            });
+            wanted.truncate(128);
+            sampler.request_detail(&wanted, self.center);
+        }
+        sections.into_values().collect()
+    }
 }
 impl Sampler {
     fn runs(column: &horizon_client::lod::Column, out: &mut Vec<SampledRun>) {
         out.extend(column.spans.iter().map(|span| SampledRun {
-            min: i32::from(span.min), max: i32::from(span.max),
-            state: span.state.0, biome: span.biome,
+            min: i32::from(span.min),
+            max: i32::from(span.max),
+            state: span.state.0,
+            biome: span.biome,
             sky: ((span.light >> 4) & 15) as u8,
             block: ((span.light >> 12) & 15) as u8,
         }));
     }
 }
 impl ColumnSampler for Sampler {
+    fn request_section(&mut self, section: i64) {
+        let width = pos::data_width(section);
+        if width > 4 {
+            return;
+        }
+        let (x, z) = (pos::min_corner_block_x(section), pos::min_corner_block_z(section));
+        let mut refine = self.refinement.lock().unwrap();
+        for dz in 0..4 {
+            for dx in 0..4 {
+                refine.request_tile(x + dx * width * 16, z + dz * width * 16, width);
+            }
+        }
+    }
+    fn view(&mut self, center: [i32; 2], near_radius: i32) {
+        let mut refine = self.refinement.lock().unwrap();
+        if refine.center == center && refine.near_radius == near_radius {
+            return;
+        }
+        refine.center = center;
+        refine.near_radius = near_radius;
+        // Bound bookkeeping as the player travels. Completed data itself is in DH's store.
+        let in_range =
+            |&(x, z): &(i32, i32)| (x * 16 + 8 - center[0]).abs().max((z * 16 + 8 - center[1]).abs()) <= 1152;
+        refine.pending.retain(in_range);
+        refine.completed.retain(in_range);
+    }
+    fn drain_refined(&mut self) -> Vec<FullDataSource> {
+        self.refinement
+            .lock()
+            .unwrap()
+            .drain(self.build_height.0, self.build_height.1)
+    }
     fn begin_section(&mut self, stride: i32) {
         self.stride = stride;
-        self.tiles.clear(); // bounded to at most 16 tiles for one DH section
+        self.tiles.clear(); // at most 64 half-stride tiles for one DH section
     }
     fn column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) {
         Self::runs(&self.inner.column(x, z), out);
     }
     fn try_column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) -> bool {
-        let tile_size = self.stride * 16;
+        // Summarise an area, rather than inflating one arbitrary rock/leaf into
+        // a full distant cell. The native reduction requires majority occupancy.
+        let sample_stride = (self.stride / 2).max(1);
+        let scale = self.stride / sample_stride;
+        let tile_size = sample_stride * 16;
         let tx = x.div_euclid(tile_size) * tile_size;
         let tz = z.div_euclid(tile_size) * tile_size;
-        let columns = self.tiles.entry((tx, tz)).or_insert_with(||
-            self.inner.grid(tx, tz, self.stride, 16));
+        let columns = self.tiles.entry((tx, tz)).or_insert_with(|| {
+            self.refinement.lock().unwrap().request_tile(tx, tz, sample_stride);
+            self.inner.grid(tx, tz, sample_stride, 16)
+        });
         // A refusal or cancellation stays missing, never becomes permanent air.
-        if columns.len() != 256 { return false; }
-        let ix = (x - tx).div_euclid(self.stride) as usize;
-        let iz = (z - tz).div_euclid(self.stride) as usize;
-        Self::runs(&columns[iz * 16 + ix], out);
+        if columns.len() != 256 {
+            return false;
+        }
+        // x/z are the cell centres supplied by DH, grids start at cell origins.
+        let ix = ((x - self.stride / 2 - tx) / sample_stride) as usize;
+        let iz = ((z - self.stride / 2 - tz) / sample_stride) as usize;
+        let columns: &[horizon_client::lod::Column; 256] = columns.as_slice().try_into().unwrap();
+        let reduced = horizon_client::lod::Column::reduced(columns, ix, iz, scale as usize);
+        Self::runs(&reduced, out);
         true
     }
 }
@@ -207,6 +351,7 @@ struct HorizonHost {
     /// The world generator, once the game has one to give.
     source: Mutex<Option<Arc<dyn LodSource>>>,
     styles: Mutex<HashMap<(u32, u8), [Option<Style>; 2]>>,
+    refinement: Arc<Mutex<Refinement>>,
 }
 
 fn direction(dir: Dir) -> Direction {
@@ -233,7 +378,10 @@ impl HorizonHost {
     fn resolve(&self, state: u32, direction: Direction) -> [Option<Style>; 2] {
         let assets = &self.context.assets;
         let render = &self.context.render;
-        let name = assets.registry.state(BlockStateId(state)).map_or("", |s| s.name.as_str());
+        let name = assets
+            .registry
+            .state(BlockStateId(state))
+            .map_or("", |s| s.name.as_str());
         let fluid = match name {
             "minecraft:water" | "minecraft:bubble_column" => Some(("block/water_still", true)),
             "minecraft:lava" => Some(("block/lava_still", false)),
@@ -264,7 +412,10 @@ impl HorizonHost {
             _ if leaves => Tint::Foliage,
             _ => Tint::Grass,
         };
-        let models = render.model_catalog.collect(BlockStateId(state), BlockPos::new(0, 0, 0)).ok();
+        let models = render
+            .model_catalog
+            .collect(BlockStateId(state), BlockPos::new(0, 0, 0))
+            .ok();
         let mut matching = models
             .iter()
             .flatten()
@@ -309,7 +460,20 @@ impl Host for HorizonHost {
     }
     fn sampler(&self) -> Option<Box<dyn ColumnSampler>> {
         let source = self.source.lock().unwrap().clone()?;
-        Some(Box::new(Sampler { inner: LodSource::sampler(source), stride: 1, tiles: HashMap::new() }))
+        let mut refine = self.refinement.lock().unwrap();
+        if refine.enabled && refine.sampler.is_none() {
+            refine.sampler = Some(LodSource::sampler(source.clone()));
+        }
+        drop(refine);
+        let original = LodSource::sampler(source);
+        let inner = original.fork().unwrap_or(original);
+        Some(Box::new(Sampler {
+            inner,
+            stride: 1,
+            tiles: HashMap::new(),
+            refinement: self.refinement.clone(),
+            build_height: (self.layout.min_y(), self.layout.max_y()),
+        }))
     }
     fn mesh(&self, section: i64, source: &FullDataSource, quads: &[Quad], debug: bool) -> SectionMesh {
         let mut mesh = SectionMesh::default();
@@ -403,9 +567,19 @@ fn emit_quad(mesh: &mut SectionMesh, face: &Face, [u0, v0, u1, v1]: [f32; 4]) {
         Dir::West | Dir::East => [pos[2], -pos[1]],
     });
     let corner = [0, 1].map(|i| uvs.iter().map(|uv| uv[i]).fold(f32::INFINITY, f32::min).floor());
-    let out = if face.translucent { &mut mesh.translucent } else { &mut mesh.solid };
+    let out = if face.translucent {
+        &mut mesh.translucent
+    } else {
+        &mut mesh.solid
+    };
     out.extend(points.into_iter().zip(uvs).map(|(pos, uv)| {
-        TerrainVertex::tiled(pos, [uv[0] - corner[0], uv[1] - corner[1]], face.layer, face.color, face.light)
+        TerrainVertex::tiled(
+            pos,
+            [uv[0] - corner[0], uv[1] - corner[1]],
+            face.layer,
+            face.color,
+            face.light,
+        )
     }));
 }
 
@@ -515,9 +689,19 @@ fn start(game: &mut Game<'_>, key: WorldKey, settings: &Settings) -> Session {
         blocks,
         source: Mutex::new(source),
         styles: Mutex::new(HashMap::new()),
+        refinement: Arc::new(Mutex::new(Refinement {
+            enabled: !key.remote,
+            ..Refinement::default()
+        })),
     };
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let engine = Engine::new(host, dir.clone(), fingerprint, work_settings(game, settings), dh::engine::worker_threads(cores).min(2));
+    let engine = Engine::new(
+        host,
+        dir.clone(),
+        fingerprint,
+        work_settings(game, settings),
+        dh::engine::worker_threads(cores).min(2),
+    );
     match &dir {
         Some(dir) => log::info!("Distant Horizons: started, keeping LODs in {}", dir.display()),
         None => log::info!("Distant Horizons: started, keeping LODs in memory"),
@@ -540,7 +724,9 @@ fn start(game: &mut Game<'_>, key: WorldKey, settings: &Settings) -> Session {
 fn stop(game: &mut Game<'_>, session: Session) {
     // Release network waits before Engine::drop joins its workers.
     if session.key.remote {
-        if let Some(remote) = &game.remote { remote.session.cancel_far_terrain(); }
+        if let Some(remote) = &game.remote {
+            remote.session.cancel_far_terrain();
+        }
     }
     if let Some(renderer) = &mut game.renderer {
         let removed: Vec<TileKey> = session.engine.shown_sections().map(tile).collect();
@@ -589,7 +775,9 @@ pub(super) fn frame(game: &mut Game<'_>) {
     }
     let mut session = session.unwrap_or_else(|| start(game, key, &settings));
     session.engine.set_settings(work_settings(game, &settings));
-    RADIUS.set(game.server_far_terrain().map_or(settings.radius_chunks(), |o| settings.radius_chunks().min(o.distance as i32)));
+    RADIUS.set(game.server_far_terrain().map_or(settings.radius_chunks(), |o| {
+        settings.radius_chunks().min(o.distance as i32)
+    }));
     let host = session.engine.host();
     if settings.generation
         && host.source.lock().unwrap().is_none()
@@ -683,13 +871,14 @@ pub(super) fn terrain_distance(value: i32) -> i32 {
 }
 
 pub(super) fn render_fog(game: &Game<'_>, kind: horizon_client::fog::FogType, fog: &mut horizon_client::fog::FogData) {
-    if RADIUS.get() > 0 && game.dim.id() == "minecraft:overworld"
+    if RADIUS.get() > 0
+        && game.dim.id() == "minecraft:overworld"
         && kind == horizon_client::fog::FogType::Atmospheric
         && game.potions.effects.get("blindness").is_none()
         && game.potions.effects.get("darkness").is_none()
     {
-        (fog.environmental_start, fog.environmental_end) = dh::distant_atmosphere(
-            RADIUS.get(), fog.environmental_start, fog.environmental_end);
+        (fog.environmental_start, fog.environmental_end) =
+            dh::distant_atmosphere(RADIUS.get(), fog.environmental_start, fog.environmental_end);
     }
 }
 
@@ -704,7 +893,9 @@ pub(super) fn with_commands(tree: &horizon_client::command::Dispatcher) -> Optio
     }
     let mut d = tree.clone();
     for alias in ["dh", "distanthorizons"] {
-        if d.find(alias).is_some() { continue; }
+        if d.find(alias).is_some() {
+            continue;
+        }
         let root = d.literal(0, alias);
         d.executes(root, MOD_COMMAND);
         for &(word, values) in dh::COMMANDS {
@@ -739,7 +930,7 @@ pub(super) fn command(game: &mut Game<'_>, command: &str) -> bool {
             });
             match session {
                 Some((s, generator, dir)) => format!(
-                    "Distant Horizons {}: {} of {} sections drawn ({} faces), {} jobs queued, {} in memory, {} generated, {} chunks read; generator {}; near {} chunks around {:?}; LODs {}",
+                    "Distant Horizons {}: {} of {} sections drawn ({} faces), {} jobs queued, {} in memory, {} generated, {} chunks read, {} refined sections; generator {}; near {} chunks around {:?}; LODs {}",
                     dh::VERSION,
                     s.shown,
                     s.wanted,
@@ -748,10 +939,15 @@ pub(super) fn command(game: &mut Game<'_>, command: &str) -> bool {
                     s.loaded,
                     s.generated,
                     s.chunks,
+                    s.refined,
                     if generator { "on" } else { "none" },
                     game.streaming.radius,
                     game.streaming.center,
-                    if dir.is_some() { "saved in the world" } else { "in memory" },
+                    if dir.is_some() {
+                        "saved in the world"
+                    } else {
+                        "in memory"
+                    },
                 ),
                 None => format!("Distant Horizons {}: not running here", dh::VERSION),
             }
@@ -773,7 +969,11 @@ pub(super) fn command(game: &mut Game<'_>, command: &str) -> bool {
                 "/dh [{}]",
                 dh::COMMANDS
                     .iter()
-                    .map(|(w, v)| if v.is_empty() { (*w).to_owned() } else { format!("{w} {}", v.join("|")) })
+                    .map(|(w, v)| if v.is_empty() {
+                        (*w).to_owned()
+                    } else {
+                        format!("{w} {}", v.join("|"))
+                    })
                     .collect::<Vec<_>>()
                     .join(" | ")
             ),
@@ -784,7 +984,11 @@ pub(super) fn command(game: &mut Game<'_>, command: &str) -> bool {
 }
 
 /// The debug box: shown with the debug detail colours.
-pub(super) fn hud(game: &mut Game<'_>, batch: &mut horizon_client::hud::HudBatch, corners: &mut horizon_client::extras_hud::Corners) {
+pub(super) fn hud(
+    game: &mut Game<'_>,
+    batch: &mut horizon_client::hud::HudBatch,
+    corners: &mut horizon_client::extras_hud::Corners,
+) {
     use horizon_client::extras::Corner;
     if !game.native_on(dh::ID) || !settings(game).debug || !game.native_corner_shown(Corner::BottomLeft) {
         return;

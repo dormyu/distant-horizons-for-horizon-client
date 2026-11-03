@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.1.0+dormyu.2";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -868,6 +868,14 @@ pub struct SampledRun {
 /// The world generator, as far terrain samples it: one column at a time,
 /// without generating chunks. Runs come from the bottom up; gaps are air.
 pub trait ColumnSampler: Send {
+    /// Queue exact features for cached preview sections as well as new samples.
+    fn request_section(&mut self, _section: i64) {}
+    /// The current near area, for bounded background feature generation.
+    fn view(&mut self, _center: [i32; 2], _near_radius: i32) {}
+    /// Completed, feature-accurate columns replace previews even while idle.
+    fn drain_refined(&mut self) -> Vec<FullDataSource> {
+        Vec::new()
+    }
     /// Begin a bounded sampling batch at this section's data spacing.
     fn begin_section(&mut self, _stride: i32) {}
     /// False means unavailable, not air (e.g. a refused server tile).
@@ -1995,6 +2003,7 @@ pub mod engine {
         pub loaded: usize,
         pub generated: usize,
         pub chunks: usize,
+        pub refined: usize,
         /// Faces in the wanted sections' meshes.
         pub quads: usize,
     }
@@ -2010,6 +2019,8 @@ pub mod engine {
         /// Merge a section's changed children into it
         /// (`FullDataUpdatePropagatorV2`, batched as it batches them).
         Propagate(i64),
+        /// Evict persisted cache data off the render thread.
+        Trim,
         Save,
     }
 
@@ -2047,6 +2058,7 @@ pub mod engine {
         propagate: HashMap<i64, u8>,
         chunks: HashMap<u64, Box<dyn ChunkView>>,
         next_chunk: u64,
+        trim_queued: bool,
     }
 
     struct Store {
@@ -2080,6 +2092,7 @@ pub mod engine {
         /// Each meshed section's face count.
         quads: Mutex<HashMap<i64, usize>>,
         chunks: AtomicUsize,
+        refined: AtomicUsize,
         /// Jobs being worked on.
         active: AtomicUsize,
     }
@@ -2127,6 +2140,7 @@ pub mod engine {
                     propagate: HashMap::new(),
                     chunks: HashMap::new(),
                     next_chunk: 0,
+                    trim_queued: false,
                 }),
                 ready: Condvar::new(),
                 store: Mutex::new(Store {
@@ -2141,6 +2155,7 @@ pub mod engine {
                 stop: AtomicBool::new(false),
                 generated: AtomicUsize::new(0),
                 chunks: AtomicUsize::new(0),
+                refined: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
                 quads: Mutex::new(HashMap::new()),
             });
@@ -2331,20 +2346,8 @@ pub mod engine {
             self.wanted = wanted;
             self.near_sections = near_sections;
             self.plan = Some(plan);
-            // Sections far from everything wanted leave memory.
-            let mut store = self.shared.store.lock().unwrap();
-            if store.sections.len() > self.wanted.len() * 3 + 256 {
-                let keep: Vec<i64> = store
-                    .sections
-                    .keys()
-                    .copied()
-                    .filter(|&s| !store.dirty.contains(&s))
-                    .filter(|s| !self.wanted.contains(s))
-                    .collect();
-                for s in keep {
-                    store.sections.remove(&s);
-                }
-            }
+            // Dropping hundreds of Vec-heavy sections here stalled a game tick.
+            push(&self.shared, Job::Trim, -1);
         }
 
         pub fn host(&self) -> &H {
@@ -2365,6 +2368,7 @@ pub mod engine {
                 loaded: self.shared.store.lock().unwrap().sections.len(),
                 generated: self.shared.generated.load(Ordering::Relaxed),
                 chunks: self.shared.chunks.load(Ordering::Relaxed),
+                refined: self.shared.refined.load(Ordering::Relaxed),
                 quads: {
                     let quads = self.shared.quads.lock().unwrap();
                     self.wanted.iter().filter_map(|s| quads.get(s)).sum()
@@ -2423,6 +2427,7 @@ pub mod engine {
         let duplicate = match job {
             Job::Section(s) => !q.sections.insert(s),
             Job::Mesh(s) => q.sections.contains(&s) || !q.meshes.insert(s),
+            Job::Trim => std::mem::replace(&mut q.trim_queued, true),
             _ => false,
         };
         if duplicate {
@@ -2442,7 +2447,20 @@ pub mod engine {
     fn work<H: Host>(shared: &Shared<H>) {
         let mut sampler: Option<Box<dyn ColumnSampler>> = None;
         loop {
-            let (job, chunk) = {
+            if let Some(sampler) = &mut sampler {
+                let near = shared.near.lock().unwrap().clone();
+                sampler.view([near.center.0 * 16, near.center.1 * 16], near.radius);
+                if shared.settings.lock().unwrap().generation {
+                    for refined in sampler.drain_refined() {
+                        let target = refined.pos;
+                        if apply(shared, target, &refined) {
+                            shared.refined.fetch_add(1, Ordering::Relaxed);
+                            changed(shared, target);
+                        }
+                    }
+                }
+            }
+            let next = {
                 let mut q = shared.queue.lock().unwrap();
                 loop {
                     if shared.stop.load(Ordering::Relaxed) {
@@ -2455,11 +2473,16 @@ pub mod engine {
                             Job::Chunk(id) => q.chunks.remove(&id),
                             _ => None,
                         };
-                        break (next.job, chunk);
+                        break Some((next.job, chunk));
                     }
-                    q = shared.ready.wait(q).unwrap();
+                    let (waiting, timed) = shared.ready.wait_timeout(q, Duration::from_millis(250)).unwrap();
+                    q = waiting;
+                    if timed.timed_out() {
+                        break None;
+                    }
                 }
             };
+            let Some((job, chunk)) = next else { continue };
             match job {
                 Job::Chunk(_) => {
                     if let Some(chunk) = chunk {
@@ -2510,6 +2533,10 @@ pub mod engine {
                     propagate(shared, s, children);
                 }
                 Job::Save => save_dirty(shared),
+                Job::Trim => {
+                    trim_store(shared);
+                    shared.queue.lock().unwrap().trim_queued = false;
+                }
             }
             shared.active.fetch_sub(1, Ordering::Relaxed);
         }
@@ -2614,7 +2641,7 @@ pub mod engine {
 
     /// Loads section `s`, then fills what it lacks: from its parent, scaled
     /// up, and from the generator when there is one.
-    fn prepare<H: Host>(shared: &Shared<H>, s: i64, generator: Option<&mut dyn ColumnSampler>) {
+    fn prepare<H: Host>(shared: &Shared<H>, s: i64, mut generator: Option<&mut dyn ColumnSampler>) {
         let blocks = shared.host.blocks();
         let (current, parent) = {
             let mut store = shared.store.lock().unwrap();
@@ -2624,6 +2651,11 @@ pub mod engine {
                 .flatten();
             (current, parent)
         };
+        if current.gen_steps.iter().any(|&step| step < gen_step::FEATURES)
+            && let Some(generator) = generator.as_mut()
+        {
+            generator.request_section(s);
+        }
         if current.missing_columns() == 0 {
             return;
         }
@@ -2681,6 +2713,25 @@ pub mod engine {
         let mesh = (!quads.is_empty()).then(|| shared.host.mesh(s, &source, &quads, settings.debug));
         shared.quads.lock().unwrap().insert(s, quads.len());
         shared.done.lock().unwrap().push(Meshed { section: s, mesh });
+    }
+
+    fn trim_store<H: Host>(shared: &Shared<H>) {
+        let wanted = shared.wanted.lock().unwrap().clone();
+        let garbage: Vec<Arc<FullDataSource>> = {
+            let mut store = shared.store.lock().unwrap();
+            if store.sections.len() <= wanted.len() * 3 + 256 {
+                return;
+            }
+            let removed: Vec<_> = store
+                .sections
+                .keys()
+                .copied()
+                .filter(|s| !store.dirty.contains(s) && !wanted.contains(s))
+                .collect();
+            removed.into_iter().filter_map(|s| store.sections.remove(&s)).collect()
+        };
+        // No store/queue lock is held during destruction. The frame keeps rendering.
+        drop(garbage);
     }
 
     fn save_dirty<H: Host>(shared: &Shared<H>) {
@@ -3177,6 +3228,100 @@ mod tests {
 
     struct FakeHost {
         blocks: BlockTable,
+    }
+
+    #[test]
+    fn completed_features_replace_preview_while_player_is_stationary() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct RefinedSampler {
+            ready: Arc<AtomicBool>,
+            sent: bool,
+        }
+        impl ColumnSampler for RefinedSampler {
+            fn column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) {
+                FakeSampler.column(x, z, out);
+            }
+            fn drain_refined(&mut self) -> Vec<FullDataSource> {
+                if self.sent || !self.ready.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
+                self.sent = true;
+                let mut source = FullDataSource::empty(pos::encode(6, 0, 0));
+                let column = column_from_runs(
+                    &mut source.mapping,
+                    &[SampledRun {
+                        min: -64,
+                        max: 80,
+                        state: GRASS,
+                        biome: 1,
+                        sky: 15,
+                        block: 0,
+                    }],
+                    -64,
+                    320,
+                );
+                source.set_column(0, 0, column, gen_step::FEATURES);
+                vec![source]
+            }
+        }
+        struct RefinedHost {
+            blocks: BlockTable,
+            ready: Arc<AtomicBool>,
+        }
+        impl Host for RefinedHost {
+            type Mesh = bool;
+            fn blocks(&self) -> &BlockTable {
+                &self.blocks
+            }
+            fn build_height(&self) -> (i32, i32) {
+                (-64, 320)
+            }
+            fn sampler(&self) -> Option<Box<dyn ColumnSampler>> {
+                Some(Box::new(RefinedSampler {
+                    ready: self.ready.clone(),
+                    sent: false,
+                }))
+            }
+            fn mesh(&self, _: i64, data: &FullDataSource, _: &[Quad], _: bool) -> bool {
+                data.gen_steps.contains(&gen_step::FEATURES)
+            }
+        }
+        let ready = Arc::new(AtomicBool::new(false));
+        let host = RefinedHost {
+            blocks: blocks(),
+            ready: ready.clone(),
+        };
+        let settings = engine::WorkSettings {
+            render: RenderSettings {
+                cave_culling: false,
+                cave_culling_height: 60,
+                min_y: -64,
+            },
+            generation: true,
+            debug: false,
+        };
+        let mut e = engine::Engine::new(host, None, 1, settings, 1);
+        let plan = DetailPlan::new(HorizontalQuality::Low, 8);
+        let started = std::time::Instant::now();
+        loop {
+            let (meshes, _) = e.update([8., 8.], plan, engine::Near::default());
+            if meshes.iter().any(|m| m.mesh == Some(true)) {
+                break;
+            }
+            let stats = e.stats();
+            if stats.shown > 0 && stats.queued == 0 {
+                ready.store(true, Ordering::Relaxed);
+            }
+            assert!(
+                started.elapsed().as_secs() < 10,
+                "stationary refinement never appeared: {stats:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(e.stats().refined > 0);
     }
     struct FakeSampler;
     impl ColumnSampler for FakeSampler {
