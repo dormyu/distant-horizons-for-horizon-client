@@ -4,7 +4,7 @@
 > f42ef42. See [ADAPTATION.md](ADAPTATION.md) for changes, attribution and limits.
 > This revision needs the bundled horizon-mixins tool patch and an explicit
 > `HORIZON_MIXINS_BIN`; the upstream automatic installers below are not verified
-> for this adaptation. Runtime checks of the compatibility candidate are pending.
+> for this adaptation. Windows solo, two-client and renderer-cleanup checks passed; visual limits remain.
 > The upstream README follows; this is not an upstream release.
 
 [Distant Horizons](https://gitlab.com/distant-horizons-team/distant-horizons)' level-of-detail terrain, ported to

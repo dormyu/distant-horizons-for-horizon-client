@@ -91,7 +91,18 @@ resident LOD quads after disabling DH: one upload call starts fading, while late
 DH frames are disabled and never release the faded tiles. Visibility of every
 retained tile was not established. dormyu.4 uses the renderer's clear_lods API to
 cancel pending uploads and release visible/fading tiles at shutdown. Native
-near/far comparison and final-binary checks are in progress.
+checks on the final5dd3d0cd executable passed: normal IL world creation, exact
+recipe, block save/reopen, unchanged old v4 recipe, and two Rust clients on a Rust
+server with a shared block and three clean exits. Renderer cleanup was confirmed:
+7,233,232 resident quads become0 after /dh off. At1080p offscreen, near16/sim8/
+DH128 medium, cap120/VSync off/audio off: static120FPS, three short flights
+116–119FPS, maximum frames22.60/25.68/20.16ms. First cold LOD fill reached288/288
+by150s, job queue0 at180s, refinement may continue. Measured peak RSS1991MiB,
+private commit4147MiB through the flights. These are limited diagnostics, not
+32/120 or heavy-pack acceptance. A native-only32/full-detail scene with no far
+geometry also shows genuine gray stone outcrops/cliffs; surface tuning and
+remaining coarse LOD/water boundaries are separate open work. Local evidence:
+RustCore/qa/dh-lifecycle-2026-11-03/reports; installation/Prism recorded separately.
 
 The following initial adaptation notes and measurements are historical c9d474d
 evidence; they do not establish f42 compatibility.
