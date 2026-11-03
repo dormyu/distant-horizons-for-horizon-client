@@ -258,18 +258,14 @@ def package():
 
 INSTALL_TXT = """Distant Horizons for Horizon Client {version}
 
-This is a native mod: it is compiled into the game, so it can't just be dropped into a mods folder.
-The installer does every step for you, and asks before it builds anything.
-
-macOS: double-click install.command. The first time, macOS may refuse a downloaded script:
-       right-click install.command > Open > Open.
-Linux: run ./install.sh in a terminal.
-Windows: no installer yet; follow README.md (Install) on GitHub.
-
-You need the Horizon launcher, signed in with a Microsoft account that owns Minecraft: Java Edition.
-The first build takes 10 to 30 minutes. Then play the "Native mods" instance; /dh in chat shows the status.
-
-Source and documentation: https://github.com/denizsahin7744/distant-horizons-for-horizon-client
+Local dormyu adaptation for Horizon f42ef42. This is source compiled into the game,
+not a dynamically loaded DLL. Read ADAPTATION.md and compatibility.json inside the
+.hnmod before building. The patched horizon-mixins tool is required; set
+HORIZON_MIXINS_BIN explicitly. Its MIT source patch is included in the bundle.
+This adaptation is checked on Windows. The upstream automatic installers have
+not been validated for this revision and are deliberately omitted here.
+Original project: https://github.com/denizsahin7744/distant-horizons-for-horizon-client
+Original authors and LGPL-3.0-only notices are retained in the source bundle.
 """
 
 
@@ -277,9 +273,8 @@ def release_zip(hnmod):
     """target/distant-horizons-for-horizon-client-<version>.zip: the .hnmod with the installer (both names keep
     their execute bit) and INSTALL.txt, for players."""
     out = TARGET / f"distant-horizons-for-horizon-client-{VERSION}.zip"
-    script = (ROOT / "tools" / "install.sh").read_bytes()
-    files = [(hnmod.name, hnmod.read_bytes(), 0o644), ("install.command", script, 0o755),
-             ("install.sh", script, 0o755), ("INSTALL.txt", INSTALL_TXT.format(version=VERSION).encode(), 0o644)]
+    files = [(hnmod.name, hnmod.read_bytes(), 0o644),
+             ("INSTALL.txt", INSTALL_TXT.format(version=VERSION).encode(), 0o644)]
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content, mode in files:
             info = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
