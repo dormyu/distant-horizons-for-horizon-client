@@ -1,5 +1,50 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Native water and near-column handoff —0.1.0+dormyu.6
+
+Horizon f42ef42, built code0807fc6, client `5b599bb2`, with unchanged
+Immersive Landscapes0.3.1/v2/descriptor6 and official Zoom2.0.0.
+
+- Far terrain is cut out only for GPU-complete near columns, using the
+  renderer's detail-column revision rather than CPU chunk membership alone.
+- Exact column masks replace per-section counts. Moving an equal number of
+  near columns now moves their holes; delayed workers cannot publish an old
+  coverage snapshot. A deduplicated follow-up mesh survives a Section job.
+- Exposed still-fluid tops and their side edges match the detailed interior
+  height8/9 minus0.001. Water beneath a solid roof keeps its full height.
+  Fluid material-face tags and the still-water top's V orientation match
+  the detailed mesher. Shader-pack-specific visual acceptance is still open.
+- The existing water-volume-v2 full-data format/fingerprint remains unchanged.
+  This patch does not force a full cache rebuild or modify world recipes.
+
+23 core tests and offline locked Clippy with warnings denied pass. Two new
+regressions fail before the fixes; a third forces a delayed worker snapshot.
+Same source-world/cache copies were compared while switching actual near
+range32 ->8 ->2 ->16 ->32, with DH128 Medium, plus movement and near32 flight.
+The reproduced black water-boundary line disappears in the checked scene:
+723 dark pixels become0 in the fixed water rectangle. This local measure
+is not a claim that every terrain/material/detail boundary is seamless.
+Seabed and vegetation detail transitions remain visible in some views.
+
+Native RU/EN creation UI, save/reopen, disabled-mod vanilla creation and
+unchanged v4/v5 recipe copies pass. A dedicated Rust server and two Rust
+clients share the world and an emerald-block update, receive DH geometry,
+keep independent Zoom input, report zero decode errors and all exit0.
+The network run is a functional near2 smoke, not remote far-quality acceptance.
+
+Short same-cache offscreen1080p/FOV90 near32/sim8/DH128 Medium/cap120,
+VSync/audio off: stationary 119.99FPS / max11.36ms;
+flight 119.62FPS / P999.65ms / max14.77ms.
+Fast profile, per-package horizon-client O2/64 codegen units/no incremental;
+other engine libraries keep their existing optimized fast profile. One Cargo
+job, all caches/temp on E:, build921.2s, minimum available RAM2.04GiB.
+This is a bounded check, not long-exploration or future heavy-pack acceptance.
+Installation/Prism readback is recorded separately in the lab native-build.json.
+
+LGPL-3.0-only and all original copyright notices remain. Original port:
+Deniz Şahin/contributors; original DH: James Seibel/contributors. This is the
+local dormyu adaptation, separate from the MIT Immersive Landscapes mod.
+
 ## Water-volume correction —0.1.0+dormyu.5
 
 Horizon f42ef42, built codeabae49b, combined runtime `c30f2439`.

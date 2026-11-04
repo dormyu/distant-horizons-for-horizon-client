@@ -1,5 +1,9 @@
 # Distant Horizons for Horizon Client
 
+> Local dormyu.6 adaptation for Horizon f42ef42. Current changes, tests and limits:
+> [ADAPTATION.md](ADAPTATION.md). The upstream README below is historical.
+
+
 > This local checkout includes dormyu's `0.1.0+dormyu.4` adaptation for Horizon
 > f42ef42. See [ADAPTATION.md](ADAPTATION.md) for changes, attribution and limits.
 > This revision needs the bundled horizon-mixins tool patch and an explicit
