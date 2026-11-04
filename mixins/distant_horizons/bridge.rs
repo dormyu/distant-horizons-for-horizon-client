@@ -421,6 +421,7 @@ impl HorizonHost {
         let tint = match name.strip_prefix("minecraft:").unwrap_or(name) {
             "spruce_leaves" => Tint::Constant(0x61_9961),
             "birch_leaves" => Tint::Constant(0x80_A755),
+            "cherry_leaves" | "azalea_leaves" | "flowering_azalea_leaves" | "pale_oak_leaves" => Tint::None,
             "leaf_litter" => Tint::Dry,
             _ if leaves => Tint::Foliage,
             _ => Tint::Grass,
@@ -511,7 +512,10 @@ impl Host for HorizonHost {
                 } else {
                     match style.tint {
                         Tint::None => 0xFF_FFFF,
-                        Tint::Grass => info.grass,
+                        Tint::Grass => {
+                            let [x, z] = q.horizontal_center(section);
+                            self.context.biomes.grass(biome, x, z)
+                        }
                         Tint::Foliage => info.foliage,
                         Tint::Dry => info.dry_foliage,
                         Tint::Water => info.water,
@@ -840,7 +844,10 @@ pub(super) fn frame(game: &mut Game<'_>) {
         radius: game.streaming.radius,
         loaded: session.loaded.clone(),
     };
-    let plan = DetailPlan::new(settings.quality, RADIUS.get());
+    let actual_near = game.remote.as_ref().map_or(game.streaming.radius, |remote| {
+        game.streaming.radius.min(remote.sent_radius())
+    });
+    let plan = DetailPlan::new(settings.quality, RADIUS.get()).with_near_radius(actual_near);
     let (meshes, removed) = session.engine.update([player.x, player.z], plan, near);
     if let Some(renderer) = &mut game.renderer {
         let mut tiles = Vec::with_capacity(meshes.len());

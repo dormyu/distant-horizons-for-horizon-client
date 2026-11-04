@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.6";
+pub const VERSION: &str = "0.1.0+dormyu.7";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -1010,10 +1010,20 @@ pub struct DetailPlan {
     min_root_detail: u8,
     /// The LOD render distance, in blocks.
     pub radius: i32,
+    boundary_radius: i32,
+    boundary_allowed: bool,
 }
 
 #[allow(dead_code)]
 impl DetailPlan {
+    /// Preserve block-scale terrain around the actual near/distant handoff.
+    pub fn with_near_radius(mut self, radius_chunks: i32) -> Self {
+        let radius = radius_chunks.saturating_mul(16);
+        if self.boundary_allowed && radius > 0 && radius < self.radius {
+            self.boundary_radius = radius;
+        }
+        self
+    }
     pub fn new(quality: HorizontalQuality, radius_chunks: i32) -> Self {
         let (base, unit) = quality.values();
         let mut plan = Self {
@@ -1022,6 +1032,12 @@ impl DetailPlan {
             max_leaf_detail: 0,
             min_root_detail: 0,
             radius: radius_chunks * 16,
+            boundary_radius: 0,
+            // Older-PC Low/Lowest profiles retain their original cost.
+            boundary_allowed: matches!(
+                quality,
+                HorizontalQuality::Medium | HorizontalQuality::High | HorizontalQuality::Extreme
+            ),
         };
         let tree_root = pos::ROOT_DETAIL_LEVEL - pos::SECTION_BLOCK_DETAIL_LEVEL;
         let min = plan.detail_from_distance(f64::from(plan.radius * 2)).saturating_sub(1);
@@ -1037,6 +1053,18 @@ impl DetailPlan {
     pub fn expected_detail_level(&self, player: [f64; 2], section: i64) -> u8 {
         let dx = f64::from(pos::center_block_x(section)) - player[0];
         let dz = f64::from(pos::center_block_z(section)) - player[1];
+        if self.boundary_radius > 0 {
+            // The vanilla near circle has one chunk of slack per axis. A
+            // small full-block ring covers it and the next couple of chunks;
+            // distant sections keep their ordinary quality/drop-off curve.
+            let half = f64::from(pos::block_width(section)) * 0.5;
+            let closest = (dx.abs() - half).max(0.).hypot((dz.abs() - half).max(0.));
+            let farthest = (dx.abs() + half).hypot(dz.abs() + half);
+            let radius = f64::from(self.boundary_radius);
+            if closest < radius + 64. && farthest > (radius - 32.).max(0.) {
+                return pos::SECTION_MINIMUM_DETAIL_LEVEL;
+            }
+        }
         let detail = self.detail_from_distance((dx * dx + dz * dz).sqrt());
         detail.min(self.min_root_detail) + pos::SECTION_MINIMUM_DETAIL_LEVEL
     }
@@ -1357,6 +1385,21 @@ pub struct Quad {
 }
 
 impl Quad {
+    /// World X/Z at this face's center, including vertical-face axis mapping.
+    pub fn horizontal_center(&self, section: i64) -> [f64; 2] {
+        let u = f64::from(self.u0 + self.u1) * 0.5;
+        let v = f64::from(self.v0 + self.v1) * 0.5;
+        let plane = f64::from(self.plane);
+        let [x, z] = match self.dir {
+            Dir::Up | Dir::Down => [u, v],
+            Dir::North | Dir::South => [u, plane],
+            Dir::West | Dir::East => [plane, u],
+        };
+        [
+            x + f64::from(pos::min_corner_block_x(section)),
+            z + f64::from(pos::min_corner_block_z(section)),
+        ]
+    }
     /// The face in block units consumed by the host's vertex writer.
     pub fn geometry(&self) -> (f32, [f32; 4]) {
         let mut plane = self.plane as f32;
@@ -3172,6 +3215,107 @@ mod tests {
             .unwrap();
         assert_eq!(pos::detail_level(*nearest), 6);
         assert!(sections.iter().any(|&s| pos::detail_level(s) >= 9));
+    }
+
+    #[test]
+    fn boundary_detail_stays_block_scale_without_widening_the_whole_view() {
+        let player = [8., 8.];
+        let base = DetailPlan::new(HorizontalQuality::Medium, 128);
+        let improved = base.with_near_radius(32);
+        let old = base.sections(player, |_| false);
+        let new = improved.sections(player, |_| false);
+        let at = |sections: &[i64], x, z| {
+            let point = pos::containing_block(pos::SECTION_MINIMUM_DETAIL_LEVEL, x, z);
+            *sections.iter().find(|&&s| pos::contains(s, point)).unwrap()
+        };
+        assert_eq!(
+            pos::data_width(at(&new, 550, 8)),
+            1,
+            "near32 must meet single-block far terrain"
+        );
+        assert!(
+            pos::data_width(at(&old, 550, 8)) > 1,
+            "fixture must expose the old resolution jump"
+        );
+        for (x, z) in [(1200, 8), (-1400, 8), (8, 1600), (8, -1900)] {
+            assert_eq!(
+                at(&old, x, z),
+                at(&new, x, z),
+                "outside the boundary ring retain normal detail"
+            );
+        }
+        assert!(
+            new.len() <= old.len() * 2,
+            "transition detail must have a bounded section budget"
+        );
+        for radius in [0, 2, 8] {
+            assert_eq!(
+                base.with_near_radius(radius).sections(player, |_| false),
+                old,
+                "do not spend extra geometry when Medium already draws this boundary at block scale"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_detail_respects_cheap_profiles_and_negative_world_positions() {
+        for quality in [HorizontalQuality::Lowest, HorizontalQuality::Low] {
+            let plan = DetailPlan::new(quality, 128);
+            assert_eq!(
+                plan.with_near_radius(32),
+                plan,
+                "cheap profiles must not add a detail ring"
+            );
+        }
+        let plan = DetailPlan::new(HorizontalQuality::Medium, 128).with_near_radius(32);
+        for player in [[8., 8.], [-104., -216.], [4104., -8184.]] {
+            let sections = plan.sections(player, |_| false);
+            for (dx, dz) in [(544., 0.), (-544., 0.), (0., 544.), (0., -544.)] {
+                let point = pos::containing_block(6, (player[0] + dx) as i32, (player[1] + dz) as i32);
+                let section = *sections.iter().find(|&&s| pos::contains(s, point)).unwrap();
+                assert_eq!(
+                    pos::data_width(section),
+                    1,
+                    "ring must follow the camera in every quadrant"
+                );
+            }
+            for (index, &section) in sections.iter().enumerate() {
+                assert!(
+                    sections[index + 1..]
+                        .iter()
+                        .all(|&other| !pos::contains(section, other) && !pos::contains(other, section)),
+                    "ring may not overlap its coarser neighbors"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn material_sampling_uses_world_coordinates_on_every_face() {
+        let section = pos::encode(6, -2, 3);
+        for (dir, expected) in [
+            (Dir::Up, [-120., 242.]),
+            (Dir::Down, [-120., 242.]),
+            (Dir::North, [-120., 194.]),
+            (Dir::South, [-120., 194.]),
+            (Dir::West, [-126., 200.]),
+            (Dir::East, [-126., 200.]),
+        ] {
+            let q = Quad {
+                dir,
+                plane: 2,
+                transparent: false,
+                id: 0,
+                sky: 15,
+                block: 0,
+                u0: 4,
+                v0: 40,
+                u1: 12,
+                v1: 60,
+                lower_top: false,
+            };
+            assert_eq!(q.horizontal_center(section), expected);
+        }
     }
 
     #[test]
