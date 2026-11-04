@@ -1,5 +1,54 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Bounded boundary detail and native biome colors —0.1.0+dormyu.7
+
+Horizon f42ef42, built code593671e, client `7292006b`. Immersive
+Landscapes0.3.1/v2/descriptor6 and official Zoom2.0.0 are unchanged.
+
+- Medium/High/Extreme retain one-block DH samples in a bounded band at the
+  actual near boundary, including the server-limited radius for remote games.
+  The section bounds intersecting radius-32 through radius+64 blocks are refined;
+  the rest keeps its existing distance curve. Low/Lowest keep their original plan.
+- Grass uses Horizon's own biome modifier and face-center world coordinates.
+  Dark-forest darkening and positional swamp color now match the native API.
+  Cherry/azalea/flowering-azalea/pale-oak leaves retain their precolored texture.
+- No extra shader pass, generation recipe change or full cache reset is added.
+  The existing water-volume-v2 full-data format/fingerprint is retained.
+
+26 core tests and offline locked Clippy with warnings denied pass. The boundary
+regression fails on the preceding renderer. Same source/cache copies were checked
+while changing near32 ->8 ->2 ->16 ->32, including movement and held Zoom.
+An edited flat grass platform separately compares native8 and distant near2;
+this synthetic fixture is not evidence of natural terrain quality. In fixed regions
+chosen before candidate captures, mean-RGB error fell by
+98.8% for dark forest and
+94.7% for swamp. Texture filtering,
+native biome blending, vegetation simplification and other detail transitions remain.
+
+The extra geometry has a cost. Medium near32 planning in the probe rises from230
+to328 sections; the measured scene's resident far quads change from
+5,406,894 to6,039,395. In a reopened same-cache
+1080p/FOV90 near32/sim8/DH128 Medium/cap120 test (VSync/audio off):
+
+| Measurement | Previous | This build |
+| --- | ---: | ---: |
+| Static CPU average, ms | 2.096 | 2.269 |
+| Static GPU average, ms | 3.066 | 3.076 |
+| Flight FPS | 119.60 | 119.53 |
+| Flight P99 / maximum frame, ms | 9.53 / 16.53 | 9.41 / 18.43 |
+| Process allocator commit, MB | 4221.3 | 4215.8 |
+| Renderer GPU allocated / reserved, MB | 2195.0 / 2532.0 | 2259.1 / 2532.0 |
+
+These short diagnostics do not establish cold near32, long-route or future heavy-pack
+headroom. Low/Lowest avoid this band when that quality/cost tradeoff is unwanted.
+RU/EN named creation, save/reopen, disabled-mod vanilla creation, unchanged old
+v4/v5 recipes, a dedicated Rust server and two clients with shared block/independent
+Zoom input pass. Installed Prism readback is recorded separately after installation.
+
+LGPL-3.0-only notices remain. Original Rust port: Deniz Şahin/contributors;
+original DH: James Seibel/contributors; local adaptation: dormyu. This is separate
+from the MIT Immersive Landscapes terrain mod.
+
 ## Native water and near-column handoff —0.1.0+dormyu.6
 
 Horizon f42ef42, built code0807fc6, client `5b599bb2`, with unchanged
