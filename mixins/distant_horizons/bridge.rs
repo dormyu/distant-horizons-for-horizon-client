@@ -18,7 +18,7 @@ use horizon_assets::model::Direction;
 use horizon_client::{
     chunk::{Chunk, ColumnLayout},
     lod::TileKey,
-    mesher::{OPAQUE_LAYER, SectionMesh, TerrainVertex},
+    mesher::{OPAQUE_LAYER, SectionMesh, TerrainVertex, fluid_face},
     streaming::{LodSampler, LodSource, WorkerContext},
 };
 use horizon_core::position::BlockPos;
@@ -351,6 +351,7 @@ struct Style {
     layer: u16,
     tint: Tint,
     translucent: bool,
+    fluid: bool,
 }
 
 struct HorizonHost {
@@ -411,6 +412,7 @@ impl HorizonHost {
                     layer,
                     tint,
                     translucent: water,
+                    fluid: true,
                 }),
                 None,
             ];
@@ -439,6 +441,7 @@ impl HorizonHost {
                 layer: face.layer as u16 | if leaves { OPAQUE_LAYER } else { 0 },
                 tint: if face.quad.tint_index >= 0 { tint } else { Tint::None },
                 translucent: face.translucent && !leaves,
+                fluid: false,
             });
             // Grass's tinted side overlay must follow its untinted base.
             if name != "minecraft:grass_block" || matches!(direction, Direction::Up | Direction::Down) {
@@ -454,6 +457,7 @@ impl HorizonHost {
                 layer: face.layer as u16 | if leaves { OPAQUE_LAYER } else { 0 },
                 tint: if face.quad.tint_index >= 0 { tint } else { Tint::None },
                 translucent: face.translucent && !leaves,
+                fluid: false,
             });
         }
         faces
@@ -516,15 +520,24 @@ impl Host for HorizonHost {
                 };
                 let channel = |shift: u32| (((rgb >> shift) & 255) as f32 * shade) as u32;
                 let color = channel(16) | channel(8) << 8 | channel(0) << 16 | 0xFF00_0000;
+                // Keep the same fluid-face material tags as detailed chunks;
+                // Horizon shader packs otherwise treat distant water as solid.
+                let color = if style.fluid {
+                    fluid_face(color, direction(q.dir) as usize)
+                } else {
+                    color
+                };
+                let (plane, rect) = q.geometry();
                 let face = Face {
                     dir: q.dir,
-                    plane: q.plane as f32,
+                    plane,
                     layer: style.layer,
                     light,
                     color,
                     translucent: style.translucent || q.transparent,
+                    fluid: style.fluid,
                 };
-                emit(&mut mesh, face, [q.u0, q.v0, q.u1, q.v1].map(|v| v as f32));
+                emit(&mut mesh, face, rect);
             }
         }
         mesh.sort_solid();
@@ -539,6 +552,7 @@ struct Face {
     light: u16,
     color: u32,
     translucent: bool,
+    fluid: bool,
 }
 
 /// The widest face in blocks: its tiled UVs must stay within
@@ -573,6 +587,9 @@ fn emit_quad(mesh: &mut SectionMesh, face: &Face, [u0, v0, u1, v1]: [f32; 4]) {
         points.reverse();
     }
     let uvs = points.map(|pos| match face.dir {
+        // Still fluid uses +Z, as the near mesher does. Mirroring its V
+        // coordinate changed the texture phase at the near/far boundary.
+        Dir::Up if face.fluid => [pos[0], pos[2]],
         Dir::Up | Dir::Down => [pos[0], -pos[2]],
         Dir::North | Dir::South => [pos[0], -pos[1]],
         Dir::West | Dir::East => [pos[2], -pos[1]],
@@ -622,7 +639,7 @@ struct Session {
     seen: HashMap<(i32, i32), Instant>,
     pending: Vec<(i32, i32)>,
     last_scan: Option<Instant>,
-    near_revision: Option<u64>,
+    near_revision: Option<(u64, u64)>,
     loaded: HashSet<(i32, i32)>,
 }
 
@@ -806,10 +823,17 @@ pub(super) fn frame(game: &mut Game<'_>) {
         SESSION.set(Some(session));
         return;
     };
-    let revision = game.world.chunks.membership_revision();
+    let renderer = game.renderer.as_ref().expect("active DH renderer");
+    let revision = (game.world.chunks.membership_revision(), renderer.lod_detail_revision());
     if session.near_revision != Some(revision) {
         session.near_revision = Some(revision);
-        session.loaded = game.world.chunks.keys().copied().collect();
+        // Data can arrive well before its GPU mesh. Keep far coverage until
+        // every detailed section is uploaded, using the renderer's same API
+        // as the built-in LOD handoff (not CPU chunk membership alone).
+        session.loaded = renderer
+            .lod_detail_columns()
+            .filter(|key| game.world.chunks.contains_key(key))
+            .collect();
     }
     let near = Near {
         center: game.streaming.center,

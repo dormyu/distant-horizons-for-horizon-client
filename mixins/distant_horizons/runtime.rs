@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.5";
+pub const VERSION: &str = "0.1.0+dormyu.6";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -1351,6 +1351,29 @@ pub struct Quad {
     pub v0: i32,
     pub u1: i32,
     pub v1: i32,
+    /// An exposed fluid top, or the upper edge of a side that meets it.
+    /// Covered water below a roof remains a full block high.
+    pub lower_top: bool,
+}
+
+impl Quad {
+    /// The face in block units consumed by the host's vertex writer.
+    pub fn geometry(&self) -> (f32, [f32; 4]) {
+        let mut plane = self.plane as f32;
+        let mut rect = [self.u0, self.v0, self.u1, self.v1].map(|v| v as f32);
+        if self.lower_top {
+            // The detailed mesher's still-fluid interior is 8/9 high,
+            // minus its 0.001 epsilon. Keep integer full data on disk;
+            // project only the exposed render surface to the same height.
+            const LOWER: f32 = 1.0 / 9.0 + 0.001;
+            if self.dir == Dir::Up {
+                plane -= LOWER;
+            } else if self.dir != Dir::Down {
+                rect[3] -= LOWER;
+            }
+        }
+        (plane, rect)
+    }
 }
 
 /// A vertical range of a side face and the sky light it gets; `covered`
@@ -1476,6 +1499,10 @@ fn add_box(quads: &mut Vec<Quad>, at: BoxAt, p: u64, top: u64, bottom: u64, adj:
     let (x0, z0, w) = (at.min_x, at.min_z, at.width);
     let y0 = at.min_y + at.min_world_y;
     let y1 = at.max_y + at.min_world_y;
+    let skip_top = render_point::exists(top)
+        && render_point::y_min(top) == at.max_y
+        && (!top_transparent || (transparent && is_same_transparent_block(top, color, material)));
+    let exposed_fluid = render_point::is_fluid(p) && !skip_top;
     let quad = |dir, plane, u0, v0, u1, v1, sky: i8| Quad {
         dir,
         plane,
@@ -1487,10 +1514,8 @@ fn add_box(quads: &mut Vec<Quad>, at: BoxAt, p: u64, top: u64, bottom: u64, adj:
         v0,
         u1,
         v1,
+        lower_top: exposed_fluid && dir == Dir::Up,
     };
-    let skip_top = render_point::exists(top)
-        && render_point::y_min(top) == at.max_y
-        && (!top_transparent || (transparent && is_same_transparent_block(top, color, material)));
     if !skip_top {
         quads.push(quad(Dir::Up, y1, x0, z0, x0 + w, z0 + w, sky));
     }
@@ -1544,6 +1569,7 @@ fn add_box(quads: &mut Vec<Quad>, at: BoxAt, p: u64, top: u64, bottom: u64, adj:
                 v0,
                 u1: u + w,
                 v1,
+                lower_top: exposed_fluid && s.end == at.max_y,
             });
         }
     }
@@ -1671,9 +1697,35 @@ fn apply_light_to_range(segments: &[Segment], start: i32, end: i32, light: i8, c
 pub fn merge_quads(quads: &mut Vec<Quad>) {
     for pass in 0..2 {
         if pass == 0 {
-            quads.sort_unstable_by_key(|q| (q.dir, q.plane, q.transparent, q.id, q.sky, q.block, q.v0, q.v1, q.u0));
+            quads.sort_unstable_by_key(|q| {
+                (
+                    q.dir,
+                    q.plane,
+                    q.transparent,
+                    q.id,
+                    q.sky,
+                    q.block,
+                    q.lower_top,
+                    q.v0,
+                    q.v1,
+                    q.u0,
+                )
+            });
         } else {
-            quads.sort_unstable_by_key(|q| (q.dir, q.plane, q.transparent, q.id, q.sky, q.block, q.u0, q.u1, q.v0));
+            quads.sort_unstable_by_key(|q| {
+                (
+                    q.dir,
+                    q.plane,
+                    q.transparent,
+                    q.id,
+                    q.sky,
+                    q.block,
+                    q.lower_top,
+                    q.u0,
+                    q.u1,
+                    q.v0,
+                )
+            });
         }
         let mut merged: Vec<Quad> = Vec::with_capacity(quads.len());
         for &q in quads.iter() {
@@ -1683,12 +1735,22 @@ pub fn merge_quads(quads: &mut Vec<Quad>) {
                     && last.transparent == q.transparent
                     && last.id == q.id
                     && last.sky == q.sky
-                    && last.block == q.block;
+                    && last.block == q.block
+                    && last.lower_top == q.lower_top;
                 if same && pass == 0 && last.v0 == q.v0 && last.v1 == q.v1 && last.u1 == q.u0 {
                     last.u1 = q.u1;
                     continue;
                 }
-                if same && pass == 1 && last.u0 == q.u0 && last.u1 == q.u1 && last.v1 == q.v0 {
+                // Lowered side tops may not merge vertically: that would
+                // erase the exposed edge at the end of the lower rectangle.
+                let vertical_side = !matches!(q.dir, Dir::Up | Dir::Down);
+                if same
+                    && pass == 1
+                    && !(vertical_side && q.lower_top)
+                    && last.u0 == q.u0
+                    && last.u1 == q.u1
+                    && last.v1 == q.v0
+                {
                     last.v1 = q.v1;
                     continue;
                 }
@@ -1989,10 +2051,13 @@ pub mod engine {
     pub struct Meshed<M> {
         pub section: i64,
         pub mesh: Option<M>,
+        /// The exact holes used by this worker, checked before publishing:
+        /// near meshes may arrive while its far mesh is still being built.
+        cutout: Option<Vec<u64>>,
     }
 
-    /// The near area the game draws itself: chunks it has loaded within its
-    /// render distance. Their columns are left out of the LODs.
+    /// The near area the game draws itself: GPU-complete chunk columns
+    /// within its render distance. CPU-loaded chunks alone are insufficient.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct Near {
         pub center: (i32, i32),
@@ -2008,6 +2073,28 @@ pub mod engine {
             let dz = (z - self.center.1).abs().max(1) - 1;
             let r = self.radius;
             dx * dx + dz * dz < r * r && self.loaded.contains(&(x, z))
+        }
+
+        fn section_mask(&self, section: i64) -> Option<Vec<u64>> {
+            let (x0, z0) = (
+                pos::min_corner_block_x(section) >> 4,
+                pos::min_corner_block_z(section) >> 4,
+            );
+            let n = (pos::block_width(section) >> 4).max(1);
+            // Wider data columns never cut holes around individual chunks.
+            if n > 64 {
+                return None;
+            }
+            let mut mask = vec![0u64; (n as usize * n as usize).div_ceil(64)];
+            for dx in 0..n {
+                for dz in 0..n {
+                    if self.covers(x0 + dx, z0 + dz) {
+                        let index = (dx * n + dz) as usize;
+                        mask[index / 64] |= 1 << (index % 64);
+                    }
+                }
+            }
+            Some(mask)
         }
     }
 
@@ -2065,9 +2152,10 @@ pub mod engine {
     struct Queue {
         heap: BinaryHeap<Queued>,
         sequence: u64,
-        /// Sections to load or generate, queued or being worked on: not
-        /// queued twice, and meshed when done, so no `Mesh` job is needed.
+        /// Sections to load or generate, queued or being worked on.
         sections: HashSet<i64>,
+        /// One follow-up mesh if coverage/data changes during a Section job.
+        remesh_after_section: HashSet<i64>,
         /// Sections queued to mesh again.
         meshes: HashSet<i64>,
         /// Sections queued to take their children's changes: which children
@@ -2126,7 +2214,9 @@ pub mod engine {
         retiring: HashSet<i64>,
         /// Sections meshed with nothing to draw.
         blank: HashSet<i64>,
-        near_sections: HashMap<i64, usize>,
+        // Exact column positions, not their count: equal-sized near areas
+        // moving through one section must still move the holes in its mesh.
+        near_sections: HashMap<i64, Vec<u64>>,
         last_save: Instant,
         /// Where the player was last, for the order of work.
         player: [f64; 2],
@@ -2153,6 +2243,7 @@ pub mod engine {
                     heap: BinaryHeap::new(),
                     sequence: 0,
                     sections: HashSet::new(),
+                    remesh_after_section: HashSet::new(),
                     meshes: HashSet::new(),
                     propagate: HashMap::new(),
                     chunks: HashMap::new(),
@@ -2282,6 +2373,17 @@ pub mod engine {
                 if !self.wanted.contains(&m.section) {
                     continue;
                 }
+                let same_cutout = match self.near_sections.get(&m.section) {
+                    Some(expected) => m.cutout.as_ref() == Some(expected),
+                    None => m.cutout.as_ref().is_none_or(|mask| mask.iter().all(|&bits| bits == 0)),
+                };
+                if !same_cutout {
+                    // The worker finished an older coverage snapshot. Keep
+                    // the visible mesh and rebuild from the latest one;
+                    // never publish a hole where its near chunk has gone.
+                    push(&self.shared, Job::Mesh(m.section), 0);
+                    continue;
+                }
                 if m.mesh.is_some() {
                     self.shown.insert(m.section);
                     self.blank.remove(&m.section);
@@ -2329,17 +2431,9 @@ pub mod engine {
             // chunks it holds there change.
             let mut near_sections = HashMap::new();
             for &s in &wanted {
-                let (x0, z0) = (pos::min_corner_block_x(s) >> 4, pos::min_corner_block_z(s) >> 4);
-                let n = (pos::block_width(s) >> 4).max(1);
-                if n > 64 {
-                    continue;
-                }
-                let count = (0..n)
-                    .flat_map(|dx| (0..n).map(move |dz| (dx, dz)))
-                    .filter(|&(dx, dz)| near.covers(x0 + dx, z0 + dz))
-                    .count();
-                if count > 0 || self.near_sections.contains_key(&s) {
-                    near_sections.insert(s, count);
+                let Some(mask) = near.section_mask(s) else { continue };
+                if mask.iter().any(|&bits| bits != 0) || self.near_sections.contains_key(&s) {
+                    near_sections.insert(s, mask);
                 }
             }
             // Workers skip sections no longer wanted: they must see these
@@ -2443,7 +2537,13 @@ pub mod engine {
         let mut q = shared.queue.lock().unwrap();
         let duplicate = match job {
             Job::Section(s) => !q.sections.insert(s),
-            Job::Mesh(s) => q.sections.contains(&s) || !q.meshes.insert(s),
+            Job::Mesh(s) => {
+                if q.sections.contains(&s) {
+                    q.remesh_after_section.insert(s);
+                    return;
+                }
+                !q.meshes.insert(s)
+            }
             Job::Trim => std::mem::replace(&mut q.trim_queued, true),
             _ => false,
         };
@@ -2537,7 +2637,14 @@ pub mod engine {
                             shared.retry.lock().unwrap().remove(&s);
                         }
                     }
-                    shared.queue.lock().unwrap().sections.remove(&s);
+                    let remesh = {
+                        let mut queue = shared.queue.lock().unwrap();
+                        queue.sections.remove(&s);
+                        queue.remesh_after_section.remove(&s)
+                    };
+                    if remesh {
+                        push(shared, Job::Mesh(s), 0);
+                    }
                 }
                 Job::Mesh(s) => {
                     shared.queue.lock().unwrap().meshes.remove(&s);
@@ -2729,7 +2836,11 @@ pub mod engine {
         );
         let mesh = (!quads.is_empty()).then(|| shared.host.mesh(s, &source, &quads, settings.debug));
         shared.quads.lock().unwrap().insert(s, quads.len());
-        shared.done.lock().unwrap().push(Meshed { section: s, mesh });
+        shared.done.lock().unwrap().push(Meshed {
+            section: s,
+            mesh,
+            cutout: near.section_mask(s),
+        });
     }
 
     fn trim_store<H: Host>(shared: &Shared<H>) {
@@ -3343,6 +3454,245 @@ mod tests {
 
     struct FakeHost {
         blocks: BlockTable,
+    }
+
+    #[test]
+    fn parity_moving_near_holes_with_equal_column_counts_remeshes_their_positions() {
+        struct GeometryHost(BlockTable);
+        impl Host for GeometryHost {
+            type Mesh = Vec<Quad>;
+            fn blocks(&self) -> &BlockTable {
+                &self.0
+            }
+            fn build_height(&self) -> (i32, i32) {
+                (-64, 320)
+            }
+            fn sampler(&self) -> Option<Box<dyn ColumnSampler>> {
+                Some(Box::new(FakeSampler))
+            }
+            fn mesh(&self, _: i64, _: &FullDataSource, quads: &[Quad], _: bool) -> Vec<Quad> {
+                quads.to_vec()
+            }
+        }
+        let settings = engine::WorkSettings {
+            render: RenderSettings {
+                cave_culling: false,
+                cave_culling_height: 60,
+                min_y: -64,
+            },
+            generation: true,
+            debug: false,
+        };
+        let mut e = engine::Engine::new(GeometryHost(blocks()), None, 1, settings, 1);
+        let plan = DetailPlan::new(HorizontalQuality::Low, 8);
+        let mut near = engine::Near {
+            center: (0, 0),
+            radius: 8,
+            loaded: [(0, 0)].into_iter().collect(),
+        };
+        let section = pos::encode(6, 0, 0);
+        let covers = |quads: &[Quad], x, z| {
+            quads
+                .iter()
+                .any(|q| q.dir == Dir::Up && q.u0 <= x && x < q.u1 && q.v0 <= z && z < q.v1)
+        };
+        let start = std::time::Instant::now();
+        let mut initial = None;
+        loop {
+            let (meshes, _) = e.update([8., 8.], plan, near.clone());
+            for mesh in meshes {
+                if mesh.section == section {
+                    initial = mesh.mesh;
+                }
+            }
+            if initial.is_some() && e.stats().queued == 0 {
+                break;
+            }
+            assert!(start.elapsed().as_secs() < 10, "initial near/far scene did not settle");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let initial = initial.unwrap();
+        assert!(!covers(&initial, 8, 8));
+        assert!(covers(&initial, 24, 8));
+        // Still one GPU-complete near column in this section, but a different
+        // one. The old hole must fill; the new near column must be cut out.
+        near.loaded = [(1, 0)].into_iter().collect();
+        let start = std::time::Instant::now();
+        loop {
+            let (meshes, _) = e.update([8., 8.], plan, near.clone());
+            if let Some(quads) = meshes.into_iter().find(|m| m.section == section).and_then(|m| m.mesh) {
+                assert!(
+                    covers(&quads, 8, 8),
+                    "departed near column still has a far-terrain hole"
+                );
+                assert!(!covers(&quads, 24, 8), "new near column has duplicate far geometry");
+                break;
+            }
+            assert!(
+                start.elapsed().as_secs_f32() < 2.,
+                "equal-count near movement never remeshed the holes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn parity_fluid_top_and_sides_meet_native_height_without_lowering_a_roof() {
+        let mut full = FullDataSource::empty(pos::encode(6, 0, 0));
+        let [air, water, stone] = [AIR, WATER, STONE].map(|s| full.mapping.add_if_not_present(1, s));
+        for x in 0..pos::WIDTH {
+            for z in 0..pos::WIDTH {
+                let column = if x >= 32 {
+                    vec![
+                        full_point::encode(air, 120, 112, 0, 15).unwrap(),
+                        full_point::encode(stone, 112, 0, 0, 0).unwrap(),
+                    ]
+                } else if z < 4 {
+                    // A roof hides the top but not the open east side.
+                    vec![
+                        full_point::encode(air, 99, 133, 0, 15).unwrap(),
+                        full_point::encode(stone, 1, 132, 0, 15).unwrap(),
+                        full_point::encode(water, 20, 112, 0, 15).unwrap(),
+                        full_point::encode(stone, 112, 0, 0, 0).unwrap(),
+                    ]
+                } else {
+                    vec![
+                        full_point::encode(air, 100, 132, 0, 15).unwrap(),
+                        full_point::encode(water, 20, 112, 0, 15).unwrap(),
+                        full_point::encode(stone, 112, 0, 0, 0).unwrap(),
+                    ]
+                };
+                full.set_column(x, z, column, gen_step::LIGHT);
+            }
+        }
+        let settings = RenderSettings {
+            cave_culling: false,
+            cave_culling_height: 60,
+            min_y: -64,
+        };
+        let render = RenderSource::from_full(&full, &blocks(), &settings);
+        let quads = build_quads(&render, [None; 4], &settings, |_, _| false);
+        // Horizon's detailed still-fluid interior: own_height 8/9 minus
+        // FluidRenderer's 0.001 epsilon. Expected value is independent of DH.
+        let native_surface = 67. + 8. / 9. - 0.001;
+        let top = quads.iter().find(|q| q.id == water && q.dir == Dir::Up).unwrap();
+        assert!(
+            (top.geometry().0 - native_surface).abs() < 0.00002,
+            "far water top differs from detailed water"
+        );
+        let sides: Vec<_> = quads
+            .iter()
+            .filter(|q| q.id == water && q.dir == Dir::East && q.plane == 32)
+            .collect();
+        assert!(
+            sides
+                .iter()
+                .any(|q| q.u0 >= 4 && (q.geometry().1[3] - native_surface).abs() < 0.00002),
+            "open water side must meet its lowered top"
+        );
+        assert!(
+            sides.iter().any(|q| q.u1 <= 4 && q.geometry().1[3] == 68.),
+            "water beneath a solid roof must still fill the whole block"
+        );
+    }
+
+    #[test]
+    fn parity_a_worker_cannot_publish_holes_from_an_old_near_snapshot() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU8, Ordering},
+        };
+        struct DelayedHost {
+            blocks: BlockTable,
+            gate: Arc<AtomicU8>,
+        }
+        impl Host for DelayedHost {
+            type Mesh = Vec<Quad>;
+            fn blocks(&self) -> &BlockTable {
+                &self.blocks
+            }
+            fn build_height(&self) -> (i32, i32) {
+                (-64, 320)
+            }
+            fn sampler(&self) -> Option<Box<dyn ColumnSampler>> {
+                Some(Box::new(FakeSampler))
+            }
+            fn mesh(&self, section: i64, _: &FullDataSource, quads: &[Quad], _: bool) -> Vec<Quad> {
+                if section == pos::encode(6, 0, 0)
+                    && self
+                        .gate
+                        .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    let start = std::time::Instant::now();
+                    while self.gate.load(Ordering::SeqCst) == 2 && start.elapsed().as_secs() < 5 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                quads.to_vec()
+            }
+        }
+        let gate = Arc::new(AtomicU8::new(1));
+        let host = DelayedHost {
+            blocks: blocks(),
+            gate: gate.clone(),
+        };
+        let settings = engine::WorkSettings {
+            render: RenderSettings {
+                cave_culling: false,
+                cave_culling_height: 60,
+                min_y: -64,
+            },
+            generation: true,
+            debug: false,
+        };
+        let mut e = engine::Engine::new(host, None, 1, settings, 1);
+        let plan = DetailPlan::new(HorizontalQuality::Low, 8);
+        let mut near = engine::Near {
+            center: (0, 0),
+            radius: 8,
+            loaded: [(0, 0)].into_iter().collect(),
+        };
+        let start = std::time::Instant::now();
+        while gate.load(Ordering::SeqCst) != 2 {
+            e.update([8., 8.], plan, near.clone());
+            assert!(
+                start.elapsed().as_secs() < 10,
+                "worker never reached the controlled handoff"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // The old mesh already contains its holes. Move near coverage before
+        // letting that worker return, including on the first mesh of a tile.
+        near.loaded = [(1, 0)].into_iter().collect();
+        e.update([8., 8.], plan, near.clone());
+        gate.store(3, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        loop {
+            let (meshes, _) = e.update([8., 8.], plan, near.clone());
+            if let Some(quads) = meshes
+                .into_iter()
+                .find(|m| m.section == pos::encode(6, 0, 0))
+                .and_then(|m| m.mesh)
+            {
+                let covers = |x, z| {
+                    quads
+                        .iter()
+                        .any(|q| q.dir == Dir::Up && q.u0 <= x && x < q.u1 && q.v0 <= z && z < q.v1)
+                };
+                assert!(
+                    covers(8, 8),
+                    "a stale worker published a hole in the departed near column"
+                );
+                assert!(
+                    !covers(24, 8),
+                    "a stale worker published water over the new near column"
+                );
+                break;
+            }
+            assert!(start.elapsed().as_secs() < 10, "updated geometry never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     #[test]
