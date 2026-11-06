@@ -14,7 +14,10 @@ current near coverage. Bookkeeping is restricted to resident shown/blank section
 and normal disable/shutdown still calls `clear_lods`. No terrain-recipe, full-data
 cache format, or quality-distance curve change is included.
 
-27 standalone core tests and offline locked Clippy with warnings denied pass,
+The stationary `/dh clear` path also reschedules sections whose old meshes remain
+visible, rather than leaving an empty data store behind unchanged geometry.
+
+28 standalone core tests and offline locked Clippy with warnings denied pass,
 including a controlled delayed-remesh regression:
 near32 shrinks, detail remains beyond the ordinary fade interval, and its cutout is
 released in the replacement batch. The same test reverses quality while a tile is

@@ -2497,7 +2497,7 @@ pub mod engine {
             *self.shared.wanted.lock().unwrap() = wanted.clone();
             for &s in &wanted {
                 let shown = self.shown.contains(&s) || self.blank.contains(&s);
-                if !self.wanted.contains(&s) && !shown {
+                if self.plan.is_none() || (!self.wanted.contains(&s) && !shown) {
                     push(&self.shared, Job::Section(s), distance(s));
                 } else if shown
                     && (!self.published_cutouts.contains_key(&s)
@@ -4001,6 +4001,34 @@ mod tests {
                 }
             }
             assert!(start.elapsed().as_secs() < 10,"quality reversal left a permanent stale hole");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn clearing_a_stationary_view_regenerates_its_still_visible_sections() {
+        let settings = engine::WorkSettings {
+            render: RenderSettings { cave_culling:false, cave_culling_height:60, min_y:-64 },
+            generation:true, debug:false,
+        };
+        let mut e = engine::Engine::new(FakeHost { blocks:blocks() },None,1,settings,1);
+        let plan = DetailPlan::new(HorizontalQuality::Low,8);
+        let start = std::time::Instant::now();
+        loop {
+            e.update([8.,8.],plan,engine::Near::default());
+            if e.stats().queued == 0 && e.stats().shown > 0 { break; }
+            assert!(start.elapsed().as_secs() < 10,"initial view did not settle");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let before = e.stats().generated;
+        e.wipe();
+        let start = std::time::Instant::now();
+        let mut replacement = false;
+        loop {
+            let (meshes,_) = e.update([8.,8.],plan,engine::Near::default());
+            replacement |= !meshes.is_empty();
+            if replacement && e.stats().generated > before && e.stats().queued == 0 { break; }
+            assert!(start.elapsed().as_secs() < 10,"clear retained old meshes without regenerating their data");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
