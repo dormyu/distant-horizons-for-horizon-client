@@ -1,10 +1,13 @@
 # Distant Horizons for Horizon Client
 
-> Local dormyu.8 adaptation for Horizon f42ef42. Current changes, tests and limits:
+> Local dormyu.15 adaptation for Horizon f42ef42. Current changes, tests and limits:
 > [ADAPTATION.md](ADAPTATION.md). The upstream README below is historical.
+> The latest change prevents delayed worker results from replacing newer meshes.
+> Its regression checks pass; the remaining shoreline artifacts still require
+> a fresh in-game comparison. This candidate is not an installed release.
 
 
-> This local checkout includes dormyu's `0.1.0+dormyu.4` adaptation for Horizon
+> Historical integration note for dormyu's `0.1.0+dormyu.4` adaptation for Horizon
 > f42ef42. See [ADAPTATION.md](ADAPTATION.md) for changes, attribution and limits.
 > This revision needs the bundled horizon-mixins tool patch and an explicit
 > `HORIZON_MIXINS_BIN`; the upstream automatic installers below are not verified

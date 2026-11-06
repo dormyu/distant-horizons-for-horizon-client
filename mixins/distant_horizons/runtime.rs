@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.14";
+pub const VERSION: &str = "0.1.0+dormyu.15";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -2209,6 +2209,10 @@ pub mod engine {
         /// The exact holes used by this worker, checked before publishing:
         /// near meshes may arrive while its far mesh is still being built.
         cutout: Option<Vec<u64>>,
+        /// Source, neighbor, settings and coverage requests share this stamp.
+        /// Two workers can finish a section out of order.
+        revision: u64,
+        quad_count: usize,
     }
 
     /// The near area the game draws itself: GPU-complete chunk columns
@@ -2313,12 +2317,24 @@ pub mod engine {
         remesh_after_section: HashSet<i64>,
         /// Sections queued to mesh again.
         meshes: HashSet<i64>,
+        /// Latest requested appearance, including requests coalesced by dedup.
+        /// Globally increasing stamps prevent a removed/re-added section from
+        /// accidentally accepting an old result with a reused local counter.
+        mesh_revisions: HashMap<i64, u64>,
+        next_mesh_revision: u64,
         /// Sections queued to take their children's changes: which children
         /// (bit `child index`) changed.
         propagate: HashMap<i64, u8>,
         chunks: HashMap<u64, Box<dyn ChunkView>>,
         next_chunk: u64,
         trim_queued: bool,
+    }
+
+    impl Queue {
+        fn invalidate_mesh(&mut self, section: i64) {
+            self.next_mesh_revision = self.next_mesh_revision.wrapping_add(1);
+            self.mesh_revisions.insert(section, self.next_mesh_revision);
+        }
     }
 
     struct Store {
@@ -2405,6 +2421,8 @@ pub mod engine {
                     sections: HashSet::new(),
                     remesh_after_section: HashSet::new(),
                     meshes: HashSet::new(),
+                    mesh_revisions: HashMap::new(),
+                    next_mesh_revision: 0,
                     propagate: HashMap::new(),
                     chunks: HashMap::new(),
                     next_chunk: 0,
@@ -2537,6 +2555,13 @@ pub mod engine {
                 if !self.wanted.contains(&m.section) {
                     continue;
                 }
+                if self.shared.queue.lock().unwrap().mesh_revisions.get(&m.section) != Some(&m.revision) {
+                    // A newer data/neighbor/settings request already has a
+                    // queued, active or completed replacement. Keep the last
+                    // published mesh; requeueing here would invalidate that
+                    // replacement again and could starve publication.
+                    continue;
+                }
                 let same_cutout = match self.near_sections.get(&m.section) {
                     Some(expected) => m.cutout.as_ref() == Some(expected),
                     None => m.cutout.as_ref().is_none_or(|mask| mask.iter().all(|&bits| bits == 0)),
@@ -2556,6 +2581,7 @@ pub mod engine {
                     self.blank.insert(m.section);
                 }
                 self.published_cutouts.insert(m.section, m.cutout.clone());
+                self.shared.quads.lock().unwrap().insert(m.section, m.quad_count);
                 self.cutout_dirty = true;
                 meshes.push(m);
             }
@@ -2630,6 +2656,11 @@ pub mod engine {
             self.blank.retain(|s| wanted.contains(s));
             self.published_cutouts.retain(|s, _| self.shown.contains(s) || self.blank.contains(s));
             self.wanted = wanted;
+            {
+                let mut queue = self.shared.queue.lock().unwrap();
+                let Queue { mesh_revisions, sections, meshes, .. } = &mut *queue;
+                mesh_revisions.retain(|s,_| self.wanted.contains(s) || sections.contains(s) || meshes.contains(s));
+            }
             self.near_sections = near_sections;
             self.plan = Some(plan);
             // Dropping hundreds of Vec-heavy sections here stalled a game tick.
@@ -2733,6 +2764,11 @@ pub mod engine {
         /// Forgets every section, in memory and on disk.
         pub fn wipe(&mut self) {
             {
+                let mut queue = self.shared.queue.lock().unwrap();
+                let sections: Vec<_> = queue.mesh_revisions.keys().copied().collect();
+                for section in sections { queue.invalidate_mesh(section); }
+            }
+            {
                 let mut store = self.shared.store.lock().unwrap();
                 store.sections.clear();
                 store.dirty.clear();
@@ -2779,6 +2815,11 @@ pub mod engine {
 
     fn push<H: Host>(shared: &Shared<H>, job: Job, priority: i64) {
         let mut q = shared.queue.lock().unwrap();
+        if let Job::Mesh(s) = job {
+            // Even a coalesced request invalidates the snapshot of an active
+            // worker. The already queued job reads the latest stamp on start.
+            q.invalidate_mesh(s);
+        }
         let duplicate = match job {
             Job::Section(s) => !q.sections.insert(s),
             Job::Mesh(s) => {
@@ -2793,6 +2834,9 @@ pub mod engine {
         };
         if duplicate {
             return;
+        }
+        if let Job::Section(s) = job {
+            q.invalidate_mesh(s);
         }
         let sequence = q.sequence;
         q.sequence += 1;
@@ -3082,6 +3126,10 @@ pub mod engine {
     }
 
     fn mesh<H: Host>(shared: &Shared<H>, s: i64) {
+        let Some(revision) = shared.queue.lock().unwrap().mesh_revisions.get(&s).copied() else {
+            // The section left the current plan before this job started.
+            return;
+        };
         let settings = *shared.settings.lock().unwrap();
         let blocks = shared.host.blocks();
         let (source, neighbors) = {
@@ -3106,11 +3154,12 @@ pub mod engine {
             cutout,
         );
         let mesh = (!quads.is_empty()).then(|| shared.host.mesh(s, &source, &quads, settings.debug));
-        shared.quads.lock().unwrap().insert(s, quads.len());
         shared.done.lock().unwrap().push(Meshed {
             section: s,
             mesh,
             cutout: near.section_mask(s),
+            revision,
+            quad_count: quads.len(),
         });
     }
 
@@ -4582,6 +4631,96 @@ mod tests {
         }
         assert!(e.stats().refined > 0);
     }
+    #[test]
+    fn delayed_older_mesh_cannot_replace_newer_data_and_settings() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        struct BlockingHost {
+            blocks: BlockTable,
+            armed: Arc<AtomicBool>,
+            held: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+        }
+        impl Host for BlockingHost {
+            type Mesh = (bool, bool);
+            fn blocks(&self) -> &BlockTable { &self.blocks }
+            fn build_height(&self) -> (i32,i32) { (-64,320) }
+            fn sampler(&self) -> Option<Box<dyn ColumnSampler>> { Some(Box::new(FakeSampler)) }
+            fn mesh(&self, section: i64, data: &FullDataSource, _: &[Quad], debug: bool) -> Self::Mesh {
+                let updated = data.gen_steps[index(0,0)] == gen_step::LIGHT;
+                if section == pos::encode(6,0,0) && !debug && self.armed.swap(false, Ordering::SeqCst) {
+                    self.held.store(true, Ordering::SeqCst);
+                    while !self.release.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                (debug, updated)
+            }
+        }
+        // On any failed assertion, release the blocked worker before Engine::drop joins it.
+        struct ReleaseOnDrop(Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+        }
+        let armed = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let host = BlockingHost { blocks: blocks(), armed: armed.clone(), held: held.clone(), release: release.clone() };
+        let mut settings = engine::WorkSettings {
+            render: RenderSettings { cave_culling:false, cave_culling_height:60, min_y:-64 },
+            generation:true, debug:false,
+        };
+        let mut e = engine::Engine::new(host, None, 1, settings, 2);
+        let _release_on_drop = ReleaseOnDrop(release.clone());
+        let plan = DetailPlan::new(HorizontalQuality::Low, 8);
+        let section = pos::encode(6,0,0);
+        let tick = std::time::Duration::from_millis(2);
+        let started = std::time::Instant::now();
+        loop {
+            e.update([8.,8.],plan,engine::Near::default());
+            if e.stats().shown > 0 && e.stats().queued == 0 { break; }
+            assert!(started.elapsed().as_secs() < 10, "initial mesh did not settle");
+            std::thread::sleep(tick);
+        }
+        e.update([8.,8.],plan,engine::Near::default());
+        armed.store(true,Ordering::SeqCst);
+        settings.render.cave_culling = true;
+        e.set_settings(settings);
+        let started = std::time::Instant::now();
+        while !held.load(Ordering::SeqCst) {
+            e.update([8.,8.],plan,engine::Near::default());
+            assert!(started.elapsed().as_secs() < 5, "older mesh was not held");
+            std::thread::sleep(tick);
+        }
+        // A second worker handles real chunk data and new settings while the
+        // old host-side mesh is deliberately delayed. It must remain current
+        // after the older result finally arrives, even with identical cutouts.
+        e.add_chunk(Box::new(FlatChunk { x:0, z:0, height:|_,_|80 }));
+        settings.debug = true;
+        e.set_settings(settings);
+        let started = std::time::Instant::now();
+        loop {
+            let (done,_) = e.update([8.,8.],plan,engine::Near::default());
+            if done.iter().any(|m|m.section==section && m.mesh==Some((true,true))) { break; }
+            assert!(started.elapsed().as_secs() < 5, "newer mesh did not publish on the second worker");
+            std::thread::sleep(tick);
+        }
+        release.store(true,Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let mut obsolete = false;
+        loop {
+            let (done,_) = e.update([8.,8.],plan,engine::Near::default());
+            obsolete |= done.iter().any(|m|m.section==section && m.mesh.is_some_and(|state|state!=(true,true)));
+            if e.stats().queued == 0 {
+                let (done,_) = e.update([8.,8.],plan,engine::Near::default());
+                obsolete |= done.iter().any(|m|m.section==section && m.mesh.is_some_and(|state|state!=(true,true)));
+                break;
+            }
+            assert!(started.elapsed().as_secs() < 5, "queue remained stuck after delayed mesh finished");
+            std::thread::sleep(tick);
+        }
+        assert!(!obsolete, "older data/settings overwrote an already published current mesh");
+    }
+
     struct FakeSampler;
     impl ColumnSampler for FakeSampler {
         fn column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) {

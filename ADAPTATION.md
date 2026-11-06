@@ -1,5 +1,35 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Reject obsolete worker meshes — 0.1.0+dormyu.15
+
+Two workers could finish the same section out of order. Mesh-job deduplication
+ended when a worker started, and publication checked only the near cutout.
+A slow result using older data, neighbors or settings could therefore overwrite
+a newer mesh with exactly the same cutout and remain visible while stationary.
+
+Each requested section appearance now has a monotonically increasing revision,
+including requests coalesced into a pending job. Publication rejects older
+revisions and retains the last published mesh until the scheduled replacement
+arrives. Rejected results are dropped normally; rejection does not requeue and
+invalidate an already pending replacement. Revision bookkeeping is restricted
+to wanted or queued sections, and cache clearing invalidates pending results.
+Face counts now describe accepted meshes rather than late, rejected results.
+
+The two-worker regression deliberately holds an old mesh, publishes new chunk
+data and settings, then releases the older result. It fails on dormyu.14 and
+passes after the fix; all 38 standalone tests and locked offline Clippy pass.
+Existing neighbor-remesh,
+coverage, cache-clear, retry and background-retirement checks remain included.
+The background retirement behavior, terrain, mesh geometry, saved data format
+and geometry cache fingerprint are unchanged.
+
+Offline reconstruction of the reported shoreline's final saved data found no
+large section-edge curtains with known neighbors, while absent neighbors can
+produce deep exposed faces there. This supports testing stale publication but
+does not prove that it explains every artifact in the captured frame. A fresh
+same-camera visual check is required before installation or visual acceptance.
+Local adaptation by dormyu; LGPL notices and upstream attribution preserved.
+
 ## Background session retirement — 0.1.0+dormyu.14
 
 The dormyu.13 diagnostic client accepted `/dh off` immediately, but the next
