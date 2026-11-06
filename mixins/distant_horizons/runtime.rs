@@ -1704,7 +1704,11 @@ fn side_segments(
                 _ => plane == at.width * pos::WIDTH,
             };
             let lit = render_point::sky(adj) != 0 || render_point::block(adj) != 0;
-            let use_adj = on_border && lit && render_point::y_max(adj) >= at.cave_max_y && !same_fluid;
+            // A lit underwater bed is still opaque. Synthetic fresh columns
+            // can carry sky light down to that bed; exposing its covered side
+            // invents a full-height curtain under otherwise continuous water.
+            // Keep the existing above-ground detail-transition skirt policy.
+            let use_adj = on_border && lit && render_point::y_max(adj) >= at.cave_max_y && !same_fluid && !at.below_water;
             (if use_adj { adj_sky } else { SKYLIGHT_COVERED }, true)
         } else if transparent && is_same_transparent_block(adj, color, material) {
             (SKYLIGHT_COVERED, true)
@@ -3658,6 +3662,29 @@ mod tests {
         let edge: Vec<_> = quads.iter().filter(|q| q.dir == Dir::East && q.plane == 64).collect();
         assert_eq!(edge.len(), 1, "a known underwater cliff must remain");
         assert_eq!((edge[0].v0, edge[0].v1), (50, 60));
+    }
+
+    #[test]
+    fn sunlit_submerged_ground_is_occluded_across_known_section_borders() {
+        let blocks = blocks();
+        let settings = RenderSettings { cave_culling: false, cave_culling_height: 60, min_y: -64 };
+        let source = lake_source(pos::encode(6, 0, 0), 61);
+        let render = RenderSource::from_full(&source, &blocks, &settings);
+        // Fresh synthetic columns carry skylight through the water to the
+        // ground. A real lit neighbor is still solid, not a reason to expose
+        // its compressed bed down to -64 along every 64-block tile border.
+        let neighbors = [(0, -1), (0, 1), (-1, 0), (1, 0)].map(|(x, z)| {
+            RenderSource::from_full(&lake_source(pos::encode(6, x, z), 61), &blocks, &settings)
+        });
+        let quads = build_quads(&render, neighbors.each_ref().map(Some), &settings, |_, _| false);
+        let buried: Vec<_> = quads.iter().filter(|q| !matches!(q.dir, Dir::Up | Dir::Down)).collect();
+        assert!(buried.is_empty(), "known equal underwater beds exposed buried sides: {buried:?}");
+
+        let lower = RenderSource::from_full(&lake_source(pos::encode(6, 1, 0), 50), &blocks, &settings);
+        let quads = build_quads(&render, [None, None, None, Some(&lower)], &settings, |_, _| false);
+        let edge: Vec<_> = quads.iter().filter(|q| q.dir == Dir::East && q.plane == 64).collect();
+        assert_eq!(edge.len(), 1, "the exposed part of a real underwater cliff must remain");
+        assert_eq!((edge[0].v0, edge[0].v1), (50, 61));
     }
 
     #[test]

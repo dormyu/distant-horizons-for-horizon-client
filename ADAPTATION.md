@@ -1,5 +1,28 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Lit underwater borders in a fresh world — 0.1.0+dormyu.11
+
+The dormyu.10 cold-cache check on existing chunks passed, but a fresh-world
+32-to-8 transition still exposed rectangular underwater dirt/stone curtains.
+Synthetic columns carry sky light through water to the bed. A legacy section
+edge exception then drew the covered side of a lit opaque bed even when the
+known neighboring bed was identical. Its full compressed run extended to the
+world bottom; waiting for ordinary chunk data hid the defect on reopening.
+
+That lighting exception now applies only above water. Known opaque neighbors
+occlude submerged ground normally, while the uncovered height of a genuine
+underwater cliff remains visible. Above-ground detail skirts, saved full-data
+format, terrain recipes and generation work are unchanged.
+
+The new counterfactual regression fails on dormyu.10 with four buried walls
+from Y=-64 to Y=61 between equal lit lake beds. It passes after the fix and also
+checks that a real Y=50-to-61 cliff remains. Fresh-world and existing-world
+combined-client visual checks are required separately before installation;
+the earlier existing-world result does not establish fresh-world acceptance.
+All 32 standalone tests and offline locked all-target Clippy with warnings
+denied pass on this source checkpoint.
+Local adaptation by dormyu; LGPL notices and upstream attribution preserved.
+
 ## Cold-water tile borders — 0.1.0+dormyu.10
 
 The combined dormyu.9 client removed the large missing near-terrain ring, but a
