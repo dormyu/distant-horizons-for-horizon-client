@@ -1,5 +1,24 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Verified IL 0.5.0 integration — 6 November 2026
+
+Combined Horizon f42ef42 / IL224a831 / DH623dd71 / official Zoom725ff7a client
+3bb2fb54 passed new-world/save/legacy, two Rust clients, same-process world
+switching, distance32→8→32 screenshots and a cached near32/DH128 Medium run.
+The original copied-world shoreline regression retains its original hashes;
+623dd71 corrects only the displayed `.15` to `.16` byte from896318d. Actual final
+client chat shows dormyu.16 and309/309 far sections. Deep shoreline curtains and
+the detached strip are absent in the inspected fully covered views. Initial
+far preparation remains asynchronous and may show partial coverage.
+
+Final cached1080p:333.4 FPS stationary20s (P99 3.97ms,max6.61ms),319.2 FPS during
+130blocks/30s aerial motion at walking speed (P99 6.30ms,max97.94ms). The latter
+still includes a hitch. Earlier code-equivalent first-use fast flight measured
+99.3 FPS at cap120; do not present the cached result as fresh exploration or a
+performance improvement caused by the label fix. No heavy-pack/owner acceptance.
+Full source/profile/hash evidence: IL docs/validation-0.5.0.md and local QA
+release-0.5.0-final-2026-11-06. Installed-launcher delivery is a later receipt.
+
 ## Preserve partial terrain and cull invented walls — 0.1.0+dormyu.16
 
 The real `prepare` path copied completeness flags into an empty update, skipped
