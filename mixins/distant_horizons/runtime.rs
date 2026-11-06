@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.9";
+pub const VERSION: &str = "0.1.0+dormyu.10";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -1453,14 +1453,11 @@ pub fn build_quads(
             (_, z) if z == pos::WIDTH => (x, 0, 1),
             (-1, _) => (pos::WIDTH - 1, z, 2),
             (x, _) if x == pos::WIDTH => (0, z, 3),
-            _ => {
-                if cutout(x, z) {
-                    return None;
-                }
-                return Some(source.column(x, z));
-            }
+            // A cutout is drawn by the near renderer, not an air-filled
+            // hole. Its retained data must still occlude the far bank.
+            _ => return known_column(source.column(x, z)),
         };
-        neighbors[side].map(|s| s.column(nx, nz))
+        neighbors[side].and_then(|s| known_column(s.column(nx, nz)))
     };
     for x in 0..pos::WIDTH {
         for z in 0..pos::WIDTH {
@@ -1474,6 +1471,7 @@ pub fn build_quads(
                 adjacent(x - 1, z),
                 adjacent(x + 1, z),
             ];
+            let mut below_water = false;
             for (i, &p) in column.points.iter().enumerate() {
                 if !render_point::exists(p) || render_point::has_zero_height(p) {
                     break;
@@ -1494,17 +1492,24 @@ pub fn build_quads(
                         max_y: render_point::y_max(p),
                         min_world_y: settings.min_y,
                         cave_max_y,
+                        below_water,
                     },
                     p,
                     top,
                     bottom,
                     adj,
                 );
+                below_water |= render_point::material(p) == material::WATER;
             }
         }
     }
     merge_quads(&mut quads);
     quads
+}
+
+/// No data is different from a known air column (whose void has a range).
+fn known_column(column: &RenderColumn) -> Option<&RenderColumn> {
+    (!column.points.is_empty() || column.void != render_point::EMPTY_DATA).then_some(column)
 }
 
 #[derive(Clone, Copy)]
@@ -1517,6 +1522,7 @@ struct BoxAt {
     max_y: i32,
     min_world_y: i32,
     cave_max_y: i32,
+    below_water: bool,
 }
 
 fn is_same_transparent_block(p: u64, color: u32, material: u8) -> bool {
@@ -1584,7 +1590,11 @@ fn add_box(quads: &mut Vec<Quad>, at: BoxAt, p: u64, top: u64, bottom: u64, adj:
     for (side, (dir, plane, u)) in sides.into_iter().enumerate() {
         let segments = match adj[side] {
             None => {
-                if transparent && !over_void {
+                // A neighbour may still be preparing or use another detail
+                // level. Inventing an exposed wall below a water surface
+                // reveals compressed dirt/stone down to the world's bottom.
+                // Known lower beds and genuine air still use side_segments.
+                if at.below_water || (transparent && !over_void) {
                     continue;
                 }
                 vec![Segment {
@@ -2813,6 +2823,31 @@ pub mod engine {
         loaded
     }
 
+    /// Borders may belong to a cached tile that is not currently selected by
+    /// the detail plan. Read existing data without generating extra tiles or
+    /// inserting empty neighbours into the store.
+    fn cached_neighbor<H: Host>(shared: &Shared<H>, store: &mut Store, s: i64) -> Option<Arc<FullDataSource>> {
+        if let Some(found) = store.sections.get(&s) {
+            return Some(found.clone());
+        }
+        let loaded = shared.dir.as_ref().and_then(|dir| storage::load(dir, s, shared.fingerprint))?;
+        let loaded = Arc::new(loaded);
+        store.sections.insert(s, loaded.clone());
+        Some(loaded)
+    }
+
+    /// A completed neighbour changes side visibility even when this tile's
+    /// own columns and the player's near cutout have not changed.
+    fn remesh_neighbors<H: Host>(shared: &Shared<H>, s: i64) {
+        let wanted = shared.wanted.lock().unwrap();
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let neighbor = pos::adjacent(s, dx, dz);
+            if wanted.contains(&neighbor) {
+                push(shared, Job::Mesh(neighbor), 0);
+            }
+        }
+    }
+
     /// The chunk into its leaf section; the coarser levels take the change
     /// later, batched (`Propagate` jobs).
     fn add_chunk<H: Host>(shared: &Shared<H>, chunk: &dyn ChunkView) {
@@ -2913,6 +2948,7 @@ pub mod engine {
             generator.request_section(s);
         }
         if current.missing_columns() == 0 {
+            remesh_neighbors(shared, s);
             return;
         }
         let mut updated = (*current).clone();
@@ -2939,6 +2975,7 @@ pub mod engine {
                 drop(store);
                 apply(shared, s, &updated);
             }
+            remesh_neighbors(shared, s);
         }
     }
 
@@ -2949,7 +2986,7 @@ pub mod engine {
             let mut store = shared.store.lock().unwrap();
             let source = section(shared, &mut store, s);
             let neighbors = [(0, -1), (0, 1), (-1, 0), (1, 0)]
-                .map(|(dx, dz)| store.sections.get(&pos::adjacent(s, dx, dz)).cloned());
+                .map(|(dx, dz)| cached_neighbor(shared, &mut store, pos::adjacent(s, dx, dz)));
             (source, neighbors)
         };
         let near = shared.near.lock().unwrap().clone();
@@ -3575,13 +3612,121 @@ mod tests {
         assert_eq!(quads.len(), 6, "{quads:?}");
         let walls = quads.iter().filter(|q| q.dir == Dir::North).count();
         assert_eq!(walls, 1);
-        // Inner columns hide each other's sides: a hole leaves walls round it.
+        // Near-owned columns hide adjacent sides even though their top/bottom
+        // are omitted here. A renderer cutout is not a terrain excavation.
         // Merged by rows, then rows into bands: the rows above and below the
         // hole, and the two halves of its own row.
         let quads = build_quads(&render, [None; 4], &settings, |x, z| x == 10 && z == 10);
         assert_eq!(quads.iter().filter(|q| q.dir == Dir::Up).count(), 4);
         assert_eq!(quads.iter().filter(|q| q.dir == Dir::Down).count(), 4);
-        assert_eq!(quads.len(), 4 + 4 + 4 + 4);
+        assert_eq!(quads.len(), 4 + 4 + 4);
+    }
+
+    fn lake_source(section: i64, floor: i32) -> FullDataSource {
+        let mut source = FullDataSource::empty(section);
+        let column = column_from_runs(
+            &mut source.mapping,
+            &[
+                SampledRun { min: -64, max: floor, state: STONE, biome: 1, sky: 15, block: 0 },
+                SampledRun { min: floor, max: 63, state: WATER, biome: 1, sky: 15, block: 0 },
+            ],
+            -64,
+            320,
+        );
+        for x in 0..pos::WIDTH {
+            for z in 0..pos::WIDTH {
+                source.set_column(x, z, column.clone(), gen_step::LIGHT);
+            }
+        }
+        source
+    }
+
+    #[test]
+    fn cold_water_boundaries_do_not_invent_walls_but_known_underwater_cliffs_remain() {
+        let blocks = blocks();
+        let settings = RenderSettings { cave_culling: false, cave_culling_height: 60, min_y: -64 };
+        let source = lake_source(pos::encode(6, 0, 0), 60);
+        let render = RenderSource::from_full(&source, &blocks, &settings);
+        let empty = RenderSource::from_full(&FullDataSource::empty(pos::encode(6, 1, 0)), &blocks, &settings);
+        for neighbors in [[None; 4], [None, None, None, Some(&empty)]] {
+            let quads = build_quads(&render, neighbors, &settings, |_, _| false);
+            assert!(quads.iter().all(|q| matches!(q.dir, Dir::Up | Dir::Down)),
+                "unknown neighbour invented an underwater curtain: {quads:?}");
+        }
+        let lower = RenderSource::from_full(&lake_source(pos::encode(6, 1, 0), 50), &blocks, &settings);
+        let quads = build_quads(&render, [None, None, None, Some(&lower)], &settings, |_, _| false);
+        let edge: Vec<_> = quads.iter().filter(|q| q.dir == Dir::East && q.plane == 64).collect();
+        assert_eq!(edge.len(), 1, "a known underwater cliff must remain");
+        assert_eq!((edge[0].v0, edge[0].v1), (50, 60));
+    }
+
+    #[test]
+    fn prepared_and_cached_neighbors_update_underwater_border_visibility() {
+        struct LakeSampler;
+        impl ColumnSampler for LakeSampler {
+            fn column(&mut self, x: i32, _: i32, out: &mut Vec<SampledRun>) {
+                let floor = if x < 64 { 60 } else { 50 };
+                out.extend([
+                    SampledRun { min: -64, max: floor, state: STONE, biome: 1, sky: 15, block: 0 },
+                    SampledRun { min: floor, max: 63, state: WATER, biome: 1, sky: 15, block: 0 },
+                ]);
+            }
+        }
+        struct LakeHost { blocks: BlockTable }
+        impl Host for LakeHost {
+            type Mesh = Vec<Quad>;
+            fn blocks(&self) -> &BlockTable { &self.blocks }
+            fn build_height(&self) -> (i32, i32) { (-64, 320) }
+            fn sampler(&self) -> Option<Box<dyn ColumnSampler>> { Some(Box::new(LakeSampler)) }
+            fn mesh(&self, _: i64, _: &FullDataSource, quads: &[Quad], _: bool) -> Vec<Quad> { quads.to_vec() }
+        }
+        let target = pos::encode(6, 0, 0);
+        let settings = engine::WorkSettings {
+            render: RenderSettings { cave_culling: false, cave_culling_height: 60, min_y: -64 },
+            generation: true,
+            debug: false,
+        };
+        let plan = DetailPlan::new(HorizontalQuality::Low, 8);
+        let settled = |engine: &mut engine::Engine<LakeHost>, near: engine::Near| {
+            let mut last = None;
+            let start = std::time::Instant::now();
+            loop {
+                let (meshes, _) = engine.update([8., 8.], plan, near.clone());
+                for mesh in meshes {
+                    if mesh.section == target { last = mesh.mesh; }
+                }
+                if engine.stats().queued == 0 && last.is_some() { break; }
+                assert!(start.elapsed().as_secs() < 10, "lake border did not settle");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let quads = last.unwrap();
+            let edge: Vec<_> = quads.iter().filter(|q| q.dir == Dir::East && q.plane == 64).collect();
+            assert_eq!(edge.len(), 1, "prepared neighbour did not remesh the older tile");
+            assert_eq!((edge[0].v0, edge[0].v1), (50, 60), "border still exposes hidden deep material");
+        };
+        let mut engine = engine::Engine::new(LakeHost { blocks: blocks() }, None, 1, settings, 1);
+        settled(&mut engine, engine::Near::default());
+        drop(engine);
+
+        // The neighbouring tile is fully near and never prepared by this
+        // detail plan. Its existing disk data must still hide the deep wall.
+        let dir = std::env::temp_dir().join(format!("dh-cached-water-border-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        storage::save(&dir, &lake_source(target, 60), 1).unwrap();
+        storage::save(&dir, &lake_source(pos::encode(6, 1, 0), 50), 1).unwrap();
+        let near = engine::Near {
+            center: (0, 0), radius: 8,
+            loaded: (4..8).flat_map(|x| (0..4).map(move |z| (x, z))).collect(),
+        };
+        let mut engine = engine::Engine::new(LakeHost { blocks: blocks() }, Some(dir.clone()), 1,
+            engine::WorkSettings { generation: false, ..settings }, 1);
+        settled(&mut engine, near);
+        drop(engine);
+        // Only this test's two files and level directory, never a recursive
+        // deletion or any gameplay world.
+        for s in [target, pos::encode(6, 1, 0)] { std::fs::remove_file(storage::path(&dir, s)).unwrap(); }
+        std::fs::remove_dir(dir.join("6")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

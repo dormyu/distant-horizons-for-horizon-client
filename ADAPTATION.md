@@ -1,5 +1,27 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Cold-water tile borders — 0.1.0+dormyu.10
+
+The combined dormyu.9 client removed the large missing near-terrain ring, but a
+cold far-data cache still exposed rectangular dirt walls through water. A missing
+neighbour was treated as open air: compressed underground runs gained visible
+side faces. A near cutout was also incorrectly treated as an excavation.
+
+Cutout columns now retain their side-occlusion data. Unknown neighbouring data
+does not justify a wall below a covering water surface; known lower beds still
+produce their real underwater cliffs. Existing same-level neighbour files can
+provide occlusion even when that tile is not selected by the current detail plan.
+Preparing a tile notifies its four wanted neighbours to rebuild stale borders.
+This adds no frame/tick sampling and does not generate extra neighbour tiles.
+
+31 standalone tests and offline locked Clippy with warnings denied pass. New
+regressions cover unknown/empty water neighbours, a real underwater height step,
+arrival of a generated neighbour, and an unselected neighbour stored on disk.
+The previous delayed 32-to-8 handoff regressions remain green. Combined-client
+cold-cache screenshots are still required; this checkpoint is not visual or
+installation acceptance. No terrain recipe, full-data format, or quality curve
+changes. LGPL notices remain intact; local adaptation by dormyu.
+
 ## First far mesh after a near-distance reduction — 0.1.0+dormyu.9
 
 The combined dormyu.8 candidate exposed a large empty ring after ordinary render
