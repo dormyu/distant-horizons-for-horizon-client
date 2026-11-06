@@ -14,10 +14,19 @@ arrives. Rejected results are dropped normally; rejection does not requeue and
 invalidate an already pending replacement. Revision bookkeeping is restricted
 to wanted or queued sections, and cache clearing invalidates pending results.
 Face counts now describe accepted meshes rather than late, rejected results.
+Actual source replacements also invalidate their own and adjacent appearance
+stamps while the store lock is held. This closes a second ordering case: a
+previously queued Mesh may start under Section's new request stamp before
+`prepare` writes its data. Request revisions alone do not distinguish these
+two snapshots. Both direct preparation and CAS-merged chunk/refinement updates
+use the same invalidation rule; existing scheduling still supplies replacements.
 
 The two-worker regression deliberately holds an old mesh, publishes new chunk
 data and settings, then releases the older result. It fails on dormyu.14 and
-passes after the fix; all 38 standalone tests and locked offline Clippy pass.
+passes after the fix. A second regression holds a partial-data mesh while the
+real `prepare` path replaces that source under the same request; it fails before
+the write-time invalidation and passes afterward. All 39 standalone tests and
+locked offline Clippy pass.
 Existing neighbor-remesh,
 coverage, cache-clear, retry and background-retirement checks remain included.
 The background retirement behavior, terrain, mesh geometry, saved data format

@@ -3020,7 +3020,23 @@ pub mod engine {
             if store.sections.get(&target).is_some_and(|s| Arc::ptr_eq(s, &current)) {
                 store.sections.insert(target, Arc::new(updated));
                 store.dirty.insert(target);
+                invalidate_data_appearance(shared, target);
                 return true;
+            }
+        }
+    }
+
+    /// Called while holding the store lock: no worker can read the replacement
+    /// data without its appearance stamp changing first. Requests alone are not
+    /// sufficient when an earlier queued Mesh starts during Section::prepare.
+    /// The caller still schedules work through changed/prepare as before.
+    fn invalidate_data_appearance<H: Host>(shared: &Shared<H>, section: i64) {
+        let mut queue = shared.queue.lock().unwrap();
+        for (dx,dz) in [(0,0),(1,0),(-1,0),(0,1),(0,-1)] {
+            let affected=pos::adjacent(section,dx,dz);
+            // Never create bookkeeping for fully near/unrequested sections.
+            if queue.mesh_revisions.contains_key(&affected) {
+                queue.invalidate_mesh(affected);
             }
         }
     }
@@ -3115,6 +3131,7 @@ pub mod engine {
             if store.sections.get(&s).is_some_and(|n| Arc::ptr_eq(n, &current)) {
                 store.sections.insert(s, Arc::new(updated));
                 store.dirty.insert(s);
+                invalidate_data_appearance(shared, s);
                 drop(store);
             } else {
                 // A chunk changed it meanwhile: merged into the newest.
@@ -3194,6 +3211,84 @@ pub mod engine {
         };
         for source in pending {
             let _ = storage::save(dir, &source, shared.fingerprint);
+        }
+    }
+
+    #[cfg(test)]
+    mod publication_tests {
+        use super::*;
+
+        #[test]
+        fn prepare_replacement_invalidates_a_mesh_started_under_the_same_request() {
+            struct TestHost {
+                blocks: BlockTable,
+                held: Arc<AtomicBool>,
+                release: Arc<AtomicBool>,
+            }
+            impl Host for TestHost {
+                type Mesh = bool;
+                fn blocks(&self) -> &BlockTable { &self.blocks }
+                fn build_height(&self) -> (i32,i32) { (-64,320) }
+                fn sampler(&self) -> Option<Box<dyn ColumnSampler>> { None }
+                fn mesh(&self, _:i64, source:&FullDataSource, _: &[Quad], _:bool) -> bool {
+                    let complete = source.missing_columns() == 0;
+                    if !complete {
+                        self.held.store(true,Ordering::SeqCst);
+                        while !self.release.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    complete
+                }
+            }
+            struct Fill;
+            impl ColumnSampler for Fill {
+                fn column(&mut self, _:i32, _:i32, out:&mut Vec<SampledRun>) {
+                    out.push(SampledRun { min:-64,max:80,state:1,biome:0,sky:15,block:0 });
+                }
+            }
+            struct ReleaseOnDrop(Arc<AtomicBool>);
+            impl Drop for ReleaseOnDrop {
+                fn drop(&mut self) { self.0.store(true,Ordering::SeqCst); }
+            }
+            let held=Arc::new(AtomicBool::new(false));
+            let release=Arc::new(AtomicBool::new(false));
+            let blocks=BlockTable { states:vec![
+                BlockInfo { air:true,material:material::AIR,..BlockInfo::default() },
+                BlockInfo { solid:true,opacity:16,alpha:255,material:material::STONE,..BlockInfo::default() },
+            ] };
+            let settings=WorkSettings { render:RenderSettings { cave_culling:false,cave_culling_height:60,min_y:-64 },generation:true,debug:false };
+            let mut e=Engine::new(TestHost { blocks,held:held.clone(),release:release.clone() },None,1,settings,1);
+            let _release_on_drop=ReleaseOnDrop(release.clone());
+            let section=pos::encode(6,0,0);
+            let mut initial=FullDataSource::empty(section);
+            let column=column_from_runs(&mut initial.mapping,&[SampledRun { min:-64,max:63,state:1,biome:0,sky:15,block:0 }],-64,320);
+            initial.set_column(0,0,column,gen_step::SURFACE);
+            e.shared.store.lock().unwrap().sections.insert(section,Arc::new(initial));
+            // An already queued Mesh can start after Section's request stamp
+            // changes, but before that Section actually writes prepared data.
+            e.shared.queue.lock().unwrap().invalidate_mesh(section);
+            e.wanted.insert(section);
+            e.shared.wanted.lock().unwrap().insert(section);
+            let plan=DetailPlan::new(HorizontalQuality::Low,8);
+            e.plan=Some(plan);
+            e.planned_at=Some((Instant::now(),[8.,8.]));
+            let old_shared=e.shared.clone();
+            let old=std::thread::spawn(move || mesh(&old_shared,section));
+            let started=Instant::now();
+            while !held.load(Ordering::SeqCst) {
+                assert!(started.elapsed().as_secs()<5,"old partial mesh did not reach the host");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            prepare(&e.shared,section,Some(&mut Fill));
+            mesh(&e.shared,section);
+            let (new,_) = e.update([8.,8.],plan,Near::default());
+            assert!(new.iter().any(|m|m.section==section && m.mesh==Some(true)),"prepared replacement did not publish");
+            release.store(true,Ordering::SeqCst);
+            old.join().unwrap();
+            let (late,_) = e.update([8.,8.],plan,Near::default());
+            assert!(!late.iter().any(|m|m.section==section && m.mesh==Some(false)),"pre-prepare mesh overwrote the prepared source under one request stamp");
+            assert_eq!(e.stats().queued,0,"stale rejection invented an unneeded remesh");
         }
     }
 }
