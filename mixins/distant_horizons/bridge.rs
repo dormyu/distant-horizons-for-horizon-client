@@ -107,10 +107,10 @@ fn block_table(facts: &horizon_client::blocks::BlockFacts) -> BlockTable {
 fn fingerprint(facts: &horizon_client::blocks::BlockFacts) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    // Coarse parents now keep the same half-footprint occupancy threshold as
-    // generated previews. Rebuild derived files made with the old air-losing
-    // reduction; gameplay chunks and player edits stay intact.
-    "dormyu-occupancy-v3-f42ef42".hash(&mut h);
+    // Old partial preparation erased visited columns, and their reductions
+    // may have propagated nonempty but incomplete coarse data. Rebuild only
+    // derived LOD files; gameplay chunks and player edits stay intact.
+    "dormyu-sparse-prepare-v4-f42ef42".hash(&mut h);
     for s in &facts.states {
         s.name.hash(&mut h);
     }

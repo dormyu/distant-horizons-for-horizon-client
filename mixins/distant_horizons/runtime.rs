@@ -388,13 +388,18 @@ impl FullDataSource {
     }
     pub fn set_column(&mut self, x: i32, z: i32, column: Vec<u64>, step: i8) {
         let i = index(x, z);
+        let step = if column.is_empty() { gen_step::EMPTY } else { step };
         self.columns[i] = column;
         self.gen_steps[i] = step;
-        self.is_empty = false;
+        self.is_empty &= step == gen_step::EMPTY;
     }
-    /// Columns with no data yet (`EMPTY`), which the generator may fill.
+    fn column_is_missing(&self, i: usize) -> bool {
+        self.gen_steps[i] == gen_step::EMPTY || self.columns[i].is_empty()
+    }
+    /// An empty vector is unknown, even if an older cache marked it complete.
+    /// A known air column has an explicit encoded air run.
     pub fn missing_columns(&self) -> usize {
-        self.gen_steps.iter().filter(|&&s| s == gen_step::EMPTY).count()
+        (0..COLUMNS).filter(|&i| self.column_is_missing(i)).count()
     }
 
     /// `updateFromDataSource`: merges `input`, of this section, one of its
@@ -446,8 +451,11 @@ impl FullDataSource {
     fn update_from_same_detail_level(&mut self, input: &FullDataSource, remapped: &[u32]) -> Vec<usize> {
         let mut changed = Vec::new();
         for i in 0..COLUMNS {
-            let this_step = self.gen_steps[i];
+            let this_step = if self.columns[i].is_empty() { gen_step::EMPTY } else { self.gen_steps[i] };
             let input_step = input.gen_steps[i];
+            if input.columns[i].is_empty() {
+                continue;
+            }
             // Down-sampled input only replaces empty or down-sampled data;
             // anything else replaces data that is no more complete.
             let allowed = if input_step == gen_step::DOWN_SAMPLED {
@@ -493,7 +501,10 @@ impl FullDataSource {
         for x in (0..pos::WIDTH).step_by(2) {
             for z in (0..pos::WIDTH).step_by(2) {
                 let step = (0..4)
-                    .map(|i| input.gen_steps[index(x + (i & 1), z + (i >> 1))])
+                    .map(|i| {
+                        let i=index(x + (i & 1), z + (i >> 1));
+                        if input.columns[i].is_empty() { gen_step::EMPTY } else { input.gen_steps[i] }
+                    })
                     .min()
                     .unwrap_or(gen_step::EMPTY);
                 if step == gen_step::EMPTY {
@@ -533,6 +544,9 @@ impl FullDataSource {
                     continue;
                 }
                 let source = &input.columns[index(x / 2 + offset_x, z / 2 + offset_z)];
+                if source.is_empty() {
+                    continue;
+                }
                 self.columns[recipient] = source
                     .iter()
                     .map(|&p| full_point::set_id(p, remapped[full_point::id(p) as usize]))
@@ -903,6 +917,18 @@ pub fn generate_missing(
     min_build: i32,
     max_build: i32,
 ) -> usize {
+    let missing: Vec<_>=(0..COLUMNS).map(|i|source.column_is_missing(i)).collect();
+    generate_missing_where(source,sampler,min_build,max_build,|i|missing[i])
+}
+
+/// Sample a sparse update without marking skipped columns as incoming data.
+fn generate_missing_where(
+    source: &mut FullDataSource,
+    sampler: &mut dyn ColumnSampler,
+    min_build: i32,
+    max_build: i32,
+    missing: impl Fn(usize) -> bool,
+) -> usize {
     let width = pos::data_width(source.pos);
     let (base_x, base_z) = (pos::min_corner_block_x(source.pos), pos::min_corner_block_z(source.pos));
     sampler.begin_section(width);
@@ -910,7 +936,7 @@ pub fn generate_missing(
     let mut filled = 0;
     for x in 0..pos::WIDTH {
         for z in 0..pos::WIDTH {
-            if source.gen_steps[index(x, z)] != gen_step::EMPTY {
+            if !missing(index(x, z)) {
                 continue;
             }
             runs.clear();
@@ -1443,7 +1469,7 @@ const SKYLIGHT_COVERED: i8 = -1;
 /// faces of a section's boxes. Side faces are cut where the adjacent
 /// column's boxes hide them. `neighbors` holds the sections north, south,
 /// west and east of it at the same detail level, when loaded; columns at a
-/// missing neighbor draw their side faces whole. Columns `cutout` names are
+/// missing neighbor have no proven opaque cliff to draw. Columns `cutout` names are
 /// left out (the game draws that terrain itself).
 pub fn build_quads(
     source: &RenderSource,
@@ -1452,7 +1478,6 @@ pub fn build_quads(
     cutout: impl Fn(i32, i32) -> bool,
 ) -> Vec<Quad> {
     let width = pos::data_width(source.pos);
-    let cave_max_y = settings.cave_culling_height - settings.min_y;
     let mut quads = Vec::new();
     let adjacent = |x: i32, z: i32| -> Option<&RenderColumn> {
         let (nx, nz, side) = match (x, z) {
@@ -1498,7 +1523,6 @@ pub fn build_quads(
                         min_y: render_point::y_min(p),
                         max_y: render_point::y_max(p),
                         min_world_y: settings.min_y,
-                        cave_max_y,
                         below_water,
                     },
                     p,
@@ -1528,7 +1552,6 @@ struct BoxAt {
     min_y: i32,
     max_y: i32,
     min_world_y: i32,
-    cave_max_y: i32,
     below_water: bool,
 }
 
@@ -1598,10 +1621,10 @@ fn add_box(quads: &mut Vec<Quad>, at: BoxAt, p: u64, top: u64, bottom: u64, adj:
         let segments = match adj[side] {
             None => {
                 // A neighbour may still be preparing or use another detail
-                // level. Inventing an exposed wall below a water surface
+                // level. Unknown data is not air: inventing an opaque side
                 // reveals compressed dirt/stone down to the world's bottom.
                 // Known lower beds and genuine air still use side_segments.
-                if at.below_water || (transparent && !over_void) {
+                if !transparent || at.below_water || !over_void {
                     continue;
                 }
                 vec![Segment {
@@ -1611,7 +1634,7 @@ fn add_box(quads: &mut Vec<Quad>, at: BoxAt, p: u64, top: u64, bottom: u64, adj:
                     covered: false,
                 }]
             }
-            Some(column) => side_segments(at, plane, transparent, color, material, column, dir),
+            Some(column) => side_segments(at, transparent, color, material, column),
         };
         for s in segments {
             if s.sky < 0 || (transparent && s.covered) || s.end <= s.start {
@@ -1636,16 +1659,13 @@ fn add_box(quads: &mut Vec<Quad>, at: BoxAt, p: u64, top: u64, bottom: u64, adj:
 }
 
 /// `ColumnBox.makeAdjVerticalQuad`: splits a side face by the boxes of the
-/// adjacent column, each range getting the light it faces. `plane`: where
-/// the face is, in blocks from the section's corner.
+/// adjacent column, each range getting the light it faces.
 fn side_segments(
     at: BoxAt,
-    plane: i32,
     transparent: bool,
     color: u32,
     material: u8,
     column: &RenderColumn,
-    dir: Dir,
 ) -> Vec<Segment> {
     let (y_min, y_max) = (at.min_y, at.max_y);
     if column.points.is_empty() || render_point::has_zero_height(column.points[0]) {
@@ -1662,11 +1682,6 @@ fn side_segments(
         sky: 15,
         covered: false,
     }];
-    // A dry shoreline can face a wet neighbor. Its own column has no water,
-    // but the neighbor's submerged solid layers still hide the buried bank.
-    let adjacent_water_top = column.points.iter()
-        .filter(|&&p| render_point::material(p) == material::WATER)
-        .map(|&p| render_point::y_max(p)).max();
     let count = column.points.len() as isize;
     for adj_index in -1..count {
         let adj = if adj_index >= 0 {
@@ -1708,22 +1723,11 @@ fn side_segments(
             adj_max -= 1;
         }
         let (light, covers) = if !adj_transparent {
-            // A face on the section's edge, against a neighbour's box, takes
-            // that box's light when it is lit and above the cave culling
-            // height; the neighbour may draw it at another detail level.
-            let on_border = match dir {
-                Dir::West | Dir::North => plane == 0,
-                _ => plane == at.width * pos::WIDTH,
-            };
-            let lit = render_point::sky(adj) != 0 || render_point::block(adj) != 0;
-            // A lit underwater bed is still opaque. Synthetic fresh columns
-            // can carry sky light down to that bed; exposing its covered side
-            // invents a full-height curtain under otherwise continuous water.
-            // Keep the existing above-ground detail-transition skirt policy.
-            let submerged_neighbor = adjacent_water_top.is_some_and(|water| adj_max <= water);
-            let use_adj = on_border && lit && render_point::y_max(adj) >= at.cave_max_y
-                && !same_fluid && !at.below_water && !submerged_neighbor;
-            (if use_adj { adj_sky } else { SKYLIGHT_COVERED }, true)
+            // Occupied opaque ground hides this range even at a section
+            // boundary. Compressed columns may carry surface skylight all
+            // the way down; that light is not evidence of exposed terrain.
+            // Uncovered ranges still retain their ordinary cliff faces.
+            (SKYLIGHT_COVERED, true)
         } else if transparent && is_same_transparent_block(adj, color, material) {
             (SKYLIGHT_COVERED, true)
         } else {
@@ -1912,6 +1916,13 @@ pub mod storage {
                     return None;
                 }
                 column.push(p);
+            }
+        }
+        // Old prepare updates could carry LIGHT metadata with empty vectors.
+        // Such columns are unavailable, not a proof of a completely air world.
+        for (step,column) in source.gen_steps.iter_mut().zip(&source.columns) {
+            if column.is_empty() {
+                *step=gen_step::EMPTY;
             }
         }
         source.is_empty = source.gen_steps.iter().all(|&s| s == gen_step::EMPTY);
@@ -3104,7 +3115,7 @@ pub mod engine {
                 .flatten();
             (current, parent)
         };
-        if current.gen_steps.iter().any(|&step| step < gen_step::FEATURES)
+        if (current.missing_columns()>0 || current.gen_steps.iter().any(|&step| step < gen_step::FEATURES))
             && let Some(generator) = generator.as_mut()
         {
             generator.request_section(s);
@@ -3113,20 +3124,21 @@ pub mod engine {
             remesh_neighbors(shared, s);
             return;
         }
-        let mut updated = (*current).clone();
-        let mut changed = false;
-        if let Some(generator) = generator {
+        let input = if let Some(generator) = generator {
             let (min_y, max_y) = shared.host.build_height();
             let mut generated = FullDataSource::empty(s);
-            generated.gen_steps = updated.gen_steps.clone();
-            if generate_missing(&mut generated, generator, min_y, max_y) > 0 {
+            if generate_missing_where(&mut generated, generator, min_y, max_y, |i|current.column_is_missing(i)) > 0 {
                 shared.generated.fetch_add(1, Ordering::Relaxed);
-                changed |= updated.update_from(&generated, blocks);
+                Some(generated)
+            } else {
+                None
             }
-        } else if let Some(parent) = parent {
-            changed |= updated.update_from(&parent, blocks);
-        }
-        if changed {
+        } else {
+            parent.map(|p|(*p).clone())
+        };
+        let Some(input)=input else { return; };
+        let mut updated = (*current).clone();
+        if updated.update_from(&input, blocks) {
             let mut store = shared.store.lock().unwrap();
             if store.sections.get(&s).is_some_and(|n| Arc::ptr_eq(n, &current)) {
                 store.sections.insert(s, Arc::new(updated));
@@ -3136,7 +3148,7 @@ pub mod engine {
             } else {
                 // A chunk changed it meanwhile: merged into the newest.
                 drop(store);
-                apply(shared, s, &updated);
+                apply(shared, s, &input);
             }
             remesh_neighbors(shared, s);
         }
@@ -3217,6 +3229,44 @@ pub mod engine {
     #[cfg(test)]
     mod publication_tests {
         use super::*;
+
+        #[test]
+        fn partial_preparation_keeps_visited_columns_while_filling_unknowns() {
+            struct TestHost(BlockTable);
+            impl Host for TestHost {
+                type Mesh = ();
+                fn blocks(&self) -> &BlockTable { &self.0 }
+                fn build_height(&self) -> (i32,i32) { (-64,320) }
+                fn sampler(&self) -> Option<Box<dyn ColumnSampler>> { None }
+                fn mesh(&self, _:i64, _: &FullDataSource, _: &[Quad], _:bool) {}
+            }
+            struct Fill;
+            impl ColumnSampler for Fill {
+                fn column(&mut self, _:i32, _:i32, out:&mut Vec<SampledRun>) {
+                    out.push(SampledRun { min:-64,max:80,state:1,biome:0,sky:15,block:0 });
+                }
+            }
+            let blocks=BlockTable { states:vec![
+                BlockInfo { air:true,material:material::AIR,..BlockInfo::default() },
+                BlockInfo { solid:true,opacity:16,alpha:255,material:material::STONE,..BlockInfo::default() },
+            ] };
+            let settings=WorkSettings { render:RenderSettings { cave_culling:false,cave_culling_height:60,min_y:-64 },generation:true,debug:false };
+            let e=Engine::new(TestHost(blocks),None,1,settings,1);
+            let s=pos::encode(6,0,0);
+            let mut initial=FullDataSource::empty(s);
+            let visited=column_from_runs(&mut initial.mapping,&[SampledRun { min:-64,max:63,state:1,biome:0,sky:15,block:0 }],-64,320);
+            initial.set_column(0,0,visited.clone(),gen_step::LIGHT);
+            let known_air=column_from_runs(&mut initial.mapping,&[],-64,320);
+            initial.set_column(0,1,known_air.clone(),gen_step::LIGHT);
+            e.shared.store.lock().unwrap().sections.insert(s,Arc::new(initial));
+            prepare(&e.shared,s,Some(&mut Fill));
+            let prepared=e.shared.store.lock().unwrap().sections[&s].clone();
+            assert_eq!(prepared.column(0,0),visited,"preparing unknown terrain erased a visited LIGHT column");
+            assert_eq!(prepared.column(0,1),known_air,"known air must remain an explicit column");
+            assert_eq!(prepared.gen_steps[index(0,0)],gen_step::LIGHT);
+            assert_eq!(prepared.missing_columns(),0);
+            assert!(prepared.columns.iter().all(|c|!c.is_empty()),"complete metadata concealed unknown empty vectors");
+        }
 
         #[test]
         fn prepare_replacement_invalidates_a_mesh_started_under_the_same_request() {
@@ -3906,10 +3956,10 @@ mod tests {
             (up[0].plane, up[0].u0, up[0].v0, up[0].u1, up[0].v1),
             (64, 0, 0, 64, 64)
         );
-        // The bottom over the void, and the four outer walls.
-        assert_eq!(quads.len(), 6, "{quads:?}");
+        // The bottom over the void; unknown neighbors do not imply cliffs.
+        assert_eq!(quads.len(), 2, "{quads:?}");
         let walls = quads.iter().filter(|q| q.dir == Dir::North).count();
-        assert_eq!(walls, 1);
+        assert_eq!(walls, 0);
         // Near-owned columns hide adjacent sides even though their top/bottom
         // are omitted here. A renderer cutout is not a terrain excavation.
         // Merged by rows, then rows into bands: the rows above and below the
@@ -3917,7 +3967,7 @@ mod tests {
         let quads = build_quads(&render, [None; 4], &settings, |x, z| x == 10 && z == 10);
         assert_eq!(quads.iter().filter(|q| q.dir == Dir::Up).count(), 4);
         assert_eq!(quads.iter().filter(|q| q.dir == Dir::Down).count(), 4);
-        assert_eq!(quads.len(), 4 + 4 + 4);
+        assert_eq!(quads.len(), 4 + 4);
     }
 
     fn lake_source(section: i64, floor: i32) -> FullDataSource {
@@ -3999,6 +4049,95 @@ mod tests {
         let edge: Vec<_> = quads.iter().filter(|q| q.dir == Dir::East && q.plane == 64).collect();
         assert_eq!(edge.len(), 1, "the real exposed bank must remain: {edge:?}");
         assert_eq!((edge[0].v0, edge[0].v1), (61, 70), "the solid neighbor occludes the buried bank");
+    }
+
+    #[test]
+    fn lit_dry_borders_cull_only_covered_ground_and_keep_real_cliffs() {
+        let blocks = blocks();
+        let settings = RenderSettings { cave_culling: false, cave_culling_height: 60, min_y: -64 };
+        let source = |section, top, state| {
+            let mut full = FullDataSource::empty(section);
+            let column = column_from_runs(&mut full.mapping,
+                &[SampledRun { min: -64, max: top, state, biome: 1, sky: 15, block: 0 }], -64, 320);
+            for x in 0..pos::WIDTH {
+                for z in 0..pos::WIDTH {
+                    full.set_column(x, z, column.clone(), gen_step::LIGHT);
+                }
+            }
+            RenderSource::from_full(&full, &blocks, &settings)
+        };
+        let dry = source(pos::encode(6, 0, 0), 70, STONE);
+        let east = pos::encode(6, 1, 0);
+        for (label, neighbor, expected) in [
+            ("equal opaque columns", source(east, 70, STONE), Vec::new()),
+            ("lower opaque ground", source(east, 65, STONE), vec![(65, 70)]),
+            ("known air", source(east, 320, AIR), vec![(-64, 70)]),
+        ] {
+            let quads = build_quads(&dry, [None, None, None, Some(&neighbor)], &settings, |_, _| false);
+            let edge: Vec<_> = quads.iter().filter(|q| q.dir == Dir::East && q.plane == 64)
+                .map(|q| (q.v0, q.v1)).collect();
+            assert_eq!(edge, expected, "{label}: skylight must not turn occupied ground into an exposed wall");
+        }
+    }
+
+    #[test]
+    fn unknown_dry_neighbor_does_not_invent_a_cliff_but_known_air_does() {
+        let blocks=blocks();
+        let settings=RenderSettings { cave_culling:false,cave_culling_height:60,min_y:-64 };
+        let make=|s,state| {
+            let mut full=FullDataSource::empty(s);
+            let column=column_from_runs(&mut full.mapping,&[SampledRun { min:-64,max:70,state,biome:1,sky:15,block:0 }],-64,320);
+            for x in 0..64 { for z in 0..64 { full.set_column(x,z,column.clone(),gen_step::LIGHT); } }
+            RenderSource::from_full(&full,&blocks,&settings)
+        };
+        let source=make(pos::encode(6,0,0),STONE);
+        let missing=RenderSource::from_full(&FullDataSource::empty(pos::encode(6,1,0)),&blocks,&settings);
+        let air=make(pos::encode(6,1,0),AIR);
+        for (neighbor,expected,label) in [(None,vec![],"missing section"),(Some(&missing),vec![],"unknown column"),(Some(&air),vec![(-64,70)],"known air")] {
+            let quads=build_quads(&source,[None,None,None,neighbor],&settings,|_,_|false);
+            let east:Vec<_>=quads.iter().filter(|q|q.dir==Dir::East&&q.plane==64).map(|q|(q.v0,q.v1)).collect();
+            assert_eq!(east,expected,"{label}");
+        }
+    }
+
+    #[test]
+    fn an_empty_light_cache_column_is_unknown_and_can_be_regenerated() {
+        let mut source=FullDataSource::empty(pos::encode(6,0,0));
+        let known_air=column_from_runs(&mut source.mapping,&[],-64,320);
+        source.set_column(0,0,known_air.clone(),gen_step::LIGHT);
+        // Reproduce old prepare's corrupted output, bypassing normal writes.
+        source.gen_steps[index(0,1)]=gen_step::LIGHT;
+        let encoded=storage::encode(&source,123);
+        let mut recovered=storage::decode(&encoded,123).expect("legacy cache is readable");
+        assert_eq!(recovered.gen_steps[index(0,1)],gen_step::EMPTY,"empty vectors must not stay complete forever");
+        assert_eq!(recovered.column(0,0),known_air);
+        assert_eq!(generate_missing(&mut recovered,&mut FakeSampler,-64,320),COLUMNS-1);
+        assert_eq!(recovered.column(0,0),known_air,"actual air is not a missing preview");
+        assert_eq!(recovered.missing_columns(),0);
+        assert!(recovered.columns.iter().all(|c|!c.is_empty()));
+    }
+
+    #[test]
+    fn unknown_vectors_never_replace_known_data_across_detail_levels() {
+        let blocks=blocks();
+        let parent_pos=pos::encode(7,0,0);
+        let mut parent=FullDataSource::empty(parent_pos);
+        let original=column_from_runs(&mut parent.mapping,&[SampledRun {min:-64,max:75,state:STONE,biome:1,sky:15,block:0}],-64,320);
+        parent.set_column(0,0,original.clone(),gen_step::LIGHT);
+        let mut invalid=FullDataSource::empty(parent_pos);
+        invalid.mapping.add_if_not_present(1,AIR);
+        invalid.gen_steps[index(0,0)]=gen_step::LIGHT;
+        assert!(!parent.update_from(&invalid,&blocks));
+        assert_eq!(parent.column(0,0),original,"empty same-detail update erased known data");
+
+        let mut child=FullDataSource::empty(pos::child(parent_pos,0));
+        assert!(!child.update_from(&invalid,&blocks));
+        assert_eq!(child.missing_columns(),COLUMNS,"empty parent acquired down-sampled completeness");
+        let solid=column_from_runs(&mut child.mapping,&[SampledRun {min:-64,max:60,state:STONE,biome:1,sky:15,block:0}],-64,320);
+        for (x,z) in [(0,0),(0,1),(1,0)] {child.set_column(x,z,solid.clone(),gen_step::LIGHT);}
+        child.gen_steps[index(1,1)]=gen_step::LIGHT;
+        assert!(!parent.update_from(&child,&blocks));
+        assert_eq!(parent.column(0,0),original,"incomplete 2x2 children erased the known parent");
     }
 
     #[test]

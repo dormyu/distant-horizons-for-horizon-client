@@ -1,10 +1,11 @@
 # Distant Horizons for Horizon Client
 
-> Local dormyu.15 adaptation for Horizon f42ef42. Current changes, tests and limits:
+> Local dormyu.16 adaptation for Horizon f42ef42. Current changes, tests and limits:
 > [ADAPTATION.md](ADAPTATION.md). The upstream README below is historical.
-> The latest change prevents delayed worker results from replacing newer meshes.
-> Its regression checks pass; the remaining shoreline artifacts still require
-> a fresh in-game comparison. This candidate is not an installed release.
+> The latest changes preserve visited terrain during partial LOD preparation and
+> remove invented boundary walls. Derived LOD caches are rebuilt on first use.
+> Regression checks pass; a fresh in-game comparison is still required.
+> This candidate is not an installed release.
 
 
 > Historical integration note for dormyu's `0.1.0+dormyu.4` adaptation for Horizon

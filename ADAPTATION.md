@@ -1,5 +1,36 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Preserve partial terrain and cull invented walls — 0.1.0+dormyu.16
+
+The real `prepare` path copied completeness flags into an empty update, skipped
+sampling those visited columns, then merged their empty vectors back as LIGHT
+data. This erased known terrain and left holes that appeared complete forever.
+Preparation now produces a sparse update containing only sampled columns; a
+concurrent store change also receives only that update. Existing terrain and
+explicit air runs are preserved. Empty vectors remain unknown during loading,
+same-detail merging, child reduction and parent fallback, so they can be filled.
+
+Known opaque neighbors now hide occupied ranges regardless of skylight. The
+old section-edge exception exposed buried compressed terrain down to bedrock.
+Unavailable neighbors no longer imply an opaque cliff either; explicit known
+air and genuine lower terrain still retain their exposed side faces.
+
+The cache fingerprint changes because old erased columns could also produce
+nonempty, damaged parent reductions. Only derived LOD data is rebuilt; real
+world chunks, player edits and terrain generation are unchanged. First use
+requires LOD preparation again. Publication revisions and background session
+retirement from the previous adaptations remain in place.
+
+44 standalone tests and locked offline all-target Clippy pass. Regressions
+failed before the fixes for real partial preparation, empty LIGHT cache data,
+lit equal-height opaque neighbors and unavailable dry neighbors. Additional
+checks retain lower cliffs, known air, and data through all merge directions.
+An offline reconstruction of the reported final cache reduced large border
+faces from 173 to one genuine water-facing slope. This is causal mesh evidence,
+not proof that new in-game images, loading or performance are accepted. Those
+checks must run on the newly built client before installation.
+Local adaptation by dormyu; LGPL notices and upstream attribution preserved.
+
 ## Reject obsolete worker meshes — 0.1.0+dormyu.15
 
 Two workers could finish the same section out of order. Mesh-job deduplication
