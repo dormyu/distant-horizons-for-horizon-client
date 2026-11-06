@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.7";
+pub const VERSION: &str = "0.1.0+dormyu.8";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -2260,6 +2260,11 @@ pub mod engine {
         // Exact column positions, not their count: equal-sized near areas
         // moving through one section must still move the holes in its mesh.
         near_sections: HashMap<i64, Vec<u64>>,
+        /// Holes in meshes already submitted to the renderer, including tiles
+        /// still standing in while a changed quality/distance plan is prepared.
+        published_cutouts: HashMap<i64, Option<Vec<u64>>>,
+        renderer_cutout: HashSet<(i32, i32)>,
+        cutout_dirty: bool,
         last_save: Instant,
         /// Where the player was last, for the order of work.
         player: [f64; 2],
@@ -2329,6 +2334,9 @@ pub mod engine {
                 retiring: HashSet::new(),
                 blank: HashSet::new(),
                 near_sections: HashMap::new(),
+                published_cutouts: HashMap::new(),
+                renderer_cutout: HashSet::new(),
+                cutout_dirty: false,
                 last_save: Instant::now(),
                 player: [0.0; 2],
             }
@@ -2379,6 +2387,7 @@ pub mod engine {
             let now = Instant::now();
             self.player = player;
             let near_changed = **self.shared.near.lock().unwrap() != near;
+            self.cutout_dirty |= near_changed;
             let moved = self.planned_at.is_none_or(|(at, p)| {
                 let d = (p[0] - player[0]).hypot(p[1] - player[1]);
                 d >= 16.0 || (d > 0.0 && now - at > Duration::from_secs(2))
@@ -2434,6 +2443,8 @@ pub mod engine {
                     self.shown.remove(&m.section);
                     self.blank.insert(m.section);
                 }
+                self.published_cutouts.insert(m.section, m.cutout.clone());
+                self.cutout_dirty = true;
                 meshes.push(m);
             }
             // A retiring section goes once every wanted section over it has
@@ -2454,6 +2465,8 @@ pub mod engine {
             for s in &removed {
                 self.retiring.remove(s);
                 self.shown.remove(s);
+                self.published_cutouts.remove(s);
+                self.cutout_dirty = true;
             }
             (meshes, removed)
         }
@@ -2486,7 +2499,13 @@ pub mod engine {
                 let shown = self.shown.contains(&s) || self.blank.contains(&s);
                 if !self.wanted.contains(&s) && !shown {
                     push(&self.shared, Job::Section(s), distance(s));
-                } else if shown && near_sections.get(&s) != self.near_sections.get(&s) {
+                } else if shown
+                    && (!self.published_cutouts.contains_key(&s)
+                        || !same_cutout(
+                            self.published_cutouts.get(&s).and_then(Option::as_ref),
+                            near_sections.get(&s),
+                        ))
+                {
                     push(&self.shared, Job::Mesh(s), distance(s));
                 }
             }
@@ -2497,11 +2516,44 @@ pub mod engine {
             }
             self.retiring.retain(|s| !wanted.contains(s));
             self.blank.retain(|s| wanted.contains(s));
+            self.published_cutouts.retain(|s, _| self.shown.contains(s) || self.blank.contains(s));
             self.wanted = wanted;
             self.near_sections = near_sections;
             self.plan = Some(plan);
             // Dropping hundreds of Vec-heavy sections here stalled a game tick.
             push(&self.shared, Job::Trim, -1);
+        }
+
+        /// Commit with the same mesh/removal batch. Horizon retains departing
+        /// detailed chunks until upload_lods has uploaded their replacements.
+        pub fn take_cutout(&mut self) -> Option<HashSet<(i32, i32)>> {
+            if !std::mem::take(&mut self.cutout_dirty) {
+                return None;
+            }
+            let near = self.shared.near.lock().unwrap();
+            let mut covered: HashSet<_> = near.loaded.iter().copied()
+                .filter(|&(x,z)| near.covers(x,z)).collect();
+            for (&section, mask) in &self.published_cutouts {
+                let Some(mask) = mask else { continue };
+                let n = (pos::block_width(section) >> 4).max(1);
+                let (x0,z0) = (pos::min_corner_block_x(section) >> 4, pos::min_corner_block_z(section) >> 4);
+                for (word_index, &word) in mask.iter().enumerate() {
+                    let mut bits = word;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let index = (word_index * 64 + bit) as i32;
+                        if index < n * n {
+                            covered.insert((x0 + index / n, z0 + index % n));
+                        }
+                    }
+                }
+            }
+            if covered == self.renderer_cutout {
+                return None;
+            }
+            self.renderer_cutout = covered.clone();
+            Some(covered)
         }
 
         pub fn host(&self) -> &H {
@@ -2550,7 +2602,13 @@ pub mod engine {
             self.planned_at = None;
             self.plan = None;
             self.wanted.clear();
+            self.cutout_dirty = true;
         }
+    }
+
+    fn same_cutout(a: Option<&Vec<u64>>, b: Option<&Vec<u64>>) -> bool {
+        let nonempty = |mask: &&Vec<u64>| mask.iter().any(|&bits| bits != 0);
+        a.filter(nonempty) == b.filter(nonempty)
     }
 
     impl<H: Host> Drop for Engine<H> {
@@ -3835,6 +3893,114 @@ mod tests {
                 break;
             }
             assert!(start.elapsed().as_secs() < 10, "updated geometry never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn shrinking_near32_retains_detail_until_its_delayed_far_remesh_is_published() {
+        use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
+        struct DelayedHost { blocks: BlockTable, gate: Arc<AtomicU8> }
+        impl Host for DelayedHost {
+            type Mesh = Vec<Quad>;
+            fn blocks(&self) -> &BlockTable { &self.blocks }
+            fn build_height(&self) -> (i32, i32) { (-64, 320) }
+            fn sampler(&self) -> Option<Box<dyn ColumnSampler>> { Some(Box::new(FakeSampler)) }
+            fn mesh(&self, _: i64, _: &FullDataSource, quads: &[Quad], _: bool) -> Vec<Quad> {
+                if self.gate.compare_exchange(1,2,Ordering::SeqCst,Ordering::SeqCst).is_ok() {
+                    let start = std::time::Instant::now();
+                    while self.gate.load(Ordering::SeqCst) == 2 && start.elapsed().as_secs() < 5 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                quads.to_vec()
+            }
+        }
+        let gate = Arc::new(AtomicU8::new(0));
+        let settings = engine::WorkSettings {
+            render: RenderSettings { cave_culling:false, cave_culling_height:60, min_y:-64 },
+            generation:true, debug:false,
+        };
+        let mut e = engine::Engine::new(DelayedHost { blocks:blocks(), gate:gate.clone() },None,1,settings,1);
+        let plan = DetailPlan::new(HorizontalQuality::Low,8);
+        let mut near = engine::Near { center:(0,0), radius:32, loaded:[(3,0)].into_iter().collect() };
+        let mut published = std::collections::HashSet::new();
+        let start = std::time::Instant::now();
+        loop {
+            e.update([8.,8.],plan,near.clone());
+            if let Some(cutout) = e.take_cutout() { published = cutout; }
+            if e.stats().queued == 0 && e.stats().shown > 0 { break; }
+            assert!(start.elapsed().as_secs() < 10,"initial handoff did not settle");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(published.contains(&(3,0)));
+        gate.store(1,Ordering::SeqCst);
+        near.radius = 1;
+        let start = std::time::Instant::now();
+        while gate.load(Ordering::SeqCst) != 2 {
+            e.update([8.,8.],plan,near.clone());
+            if let Some(cutout) = e.take_cutout() { published = cutout; }
+            assert!(start.elapsed().as_secs() < 5,"remesh never reached gate");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(published.contains(&(3,0)),"near geometry was released before its far replacement");
+        // More than Horizon's ordinary 0.6s fade may pass with no replacement.
+        std::thread::sleep(std::time::Duration::from_millis(650));
+        let (meshes,_) = e.update([8.,8.],plan,near.clone());
+        assert!(meshes.is_empty());
+        assert!(e.take_cutout().is_none());
+        gate.store(3,Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        loop {
+            let (meshes,_) = e.update([8.,8.],plan,near.clone());
+            if let Some(cutout) = e.take_cutout() {
+                if !cutout.contains(&(3,0)) {
+                    assert!(!meshes.is_empty(),"cutout must share its replacement mesh batch");
+                    break;
+                }
+            }
+            assert!(start.elapsed().as_secs() < 5,"departing near column retained forever");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // A quality change can retire a holed tile, then make that same tile
+        // wanted again before its replacements finish. Its published mask,
+        // not the immediately previous plan's missing entry, must win.
+        let coarse = DetailPlan::new(HorizontalQuality::Lowest,32);
+        let fine = DetailPlan::new(HorizontalQuality::Extreme,32);
+        near.radius = 32;
+        near.loaded = [(15,0)].into_iter().collect();
+        let start = std::time::Instant::now();
+        loop {
+            e.update([8.,8.],coarse,near.clone());
+            if let Some(cutout) = e.take_cutout() { published = cutout; }
+            if e.stats().queued == 0 { break; }
+            assert!(start.elapsed().as_secs() < 10,"coarse scene did not settle");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(published.contains(&(15,0)));
+        gate.store(1,Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        while gate.load(Ordering::SeqCst) != 2 {
+            e.update([8.,8.],fine,near.clone());
+            if let Some(cutout) = e.take_cutout() { published = cutout; }
+            assert!(start.elapsed().as_secs() < 5,"quality replacement never reached gate");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        near.radius = 2;
+        e.update([8.,8.],coarse,near.clone());
+        if let Some(cutout) = e.take_cutout() { published = cutout; }
+        assert!(published.contains(&(15,0)),"a retiring tile forgot its published hole");
+        gate.store(3,Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        loop {
+            let (meshes,_) = e.update([8.,8.],coarse,near.clone());
+            if let Some(cutout) = e.take_cutout() {
+                if !cutout.contains(&(15,0)) {
+                    assert!(!meshes.is_empty(),"reused stale tile was not remeshed");
+                    break;
+                }
+            }
+            assert!(start.elapsed().as_secs() < 10,"quality reversal left a permanent stale hole");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }

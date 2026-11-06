@@ -1,5 +1,31 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Published near-column handoff — 0.1.0+dormyu.8
+
+Horizon f42ef42. Changing ordinary render distance now keeps departing detailed
+chunks until the far meshes replacing them have uploaded. DH submits its actual
+published cutout with the replacement mesh batch to Horizon's existing renderer
+handoff; previously it always passed `None`, allowing the near chunks' 0.6-second
+fade to expire while DH still had holes at their old positions.
+
+Published masks remain attached to shown and retiring sections. Switching quality
+back while replacements are pending therefore remeshes an old holed tile using
+current near coverage. Bookkeeping is restricted to resident shown/blank sections,
+and normal disable/shutdown still calls `clear_lods`. No terrain-recipe, full-data
+cache format, or quality-distance curve change is included.
+
+27 standalone core tests and offline locked Clippy with warnings denied pass,
+including a controlled delayed-remesh regression:
+near32 shrinks, detail remains beyond the ordinary fade interval, and its cutout is
+released in the replacement batch. The same test reverses quality while a tile is
+retiring and verifies that its old hole is rebuilt. Combined client, visual
+boundary, performance, and installation verification are still pending at this
+source checkpoint. Vegetation simplification and other visual transitions remain
+separate concerns; this is not a claim that all DH artifacts are solved.
+
+LGPL-3.0-only notices and upstream attribution are unchanged. Local adaptation by
+dormyu; no upstream publication is implied.
+
 ## Bounded boundary detail and native biome colors —0.1.0+dormyu.7
 
 Horizon f42ef42, built code593671e, client `7292006b`. Immersive

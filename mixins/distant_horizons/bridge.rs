@@ -849,6 +849,7 @@ pub(super) fn frame(game: &mut Game<'_>) {
     });
     let plan = DetailPlan::new(settings.quality, RADIUS.get()).with_near_radius(actual_near);
     let (meshes, removed) = session.engine.update([player.x, player.z], plan, near);
+    let cutout = session.engine.take_cutout().map(|columns| columns.into_iter().collect());
     if let Some(renderer) = &mut game.renderer {
         let mut tiles = Vec::with_capacity(meshes.len());
         let mut gone: Vec<TileKey> = removed.into_iter().map(tile).collect();
@@ -858,7 +859,9 @@ pub(super) fn frame(game: &mut Game<'_>) {
                 None => gone.push(tile(m.section)),
             }
         }
-        renderer.queue_lods(tiles, gone, None);
+        // Commit holes only with their replacement meshes: departing detailed
+        // chunks must survive a slow far remesh after a view-distance change.
+        renderer.queue_lods(tiles, gone, cutout);
         renderer.upload_lods(UPLOAD_BUDGET);
     }
     SESSION.set(Some(session));

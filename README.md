@@ -1,6 +1,6 @@
 # Distant Horizons for Horizon Client
 
-> Local dormyu.7 adaptation for Horizon f42ef42. Current changes, tests and limits:
+> Local dormyu.8 adaptation for Horizon f42ef42. Current changes, tests and limits:
 > [ADAPTATION.md](ADAPTATION.md). The upstream README below is historical.
 
 
