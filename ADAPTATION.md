@@ -1,5 +1,33 @@
 # dormyu adaptation for RustCore / DormLab
 
+## First far mesh after a near-distance reduction — 0.1.0+dormyu.9
+
+The combined dormyu.8 candidate exposed a large empty ring after ordinary render
+distance changed from 32 to 8 chunks. Its earlier regression covered a partially
+holed far tile. A tile wholly inside near terrain is skipped entirely, so it has
+no published cutout to preserve while its first far mesh is being prepared.
+
+The engine now retains previously published near columns while a current wanted
+far tile covers them but has not yet published unmasked geometry or a verified
+blank result. Releasing those columns remains part of the replacement upload
+batch. Columns outside the current DH tile plan are released, so travel does not
+retain old detailed terrain indefinitely. The lookup uses at most nine quadtree
+levels per previous column, only when coverage changes. Horizon's existing
+retirement, fade, CPU/GPU drawing and upload APIs need no changes.
+
+29 standalone tests pass, including a fully populated near-32 view reduced to
+near-8 with a delayed first mesh beyond the renderer's 600 ms fade. The regression
+checks both coordinate signs, actual replacement geometry, eventual release and
+bounded removal outside DH range. It fails at the missing near column when the
+dormyu.8 retention behavior is restored in an isolated test copy. Offline locked
+Clippy with all targets and warnings denied passes. Combined-client transition
+screenshots and installation remain pending at this source checkpoint; these
+tests do not establish that every DH artifact is fixed.
+
+No terrain recipe, saved full-data format or quality-distance curve changes.
+LGPL notices and upstream attribution are preserved; local adaptation by dormyu.
+The dormyu.8 notes below describe the earlier, incomplete handoff implementation.
+
 ## Published near-column handoff — 0.1.0+dormyu.8
 
 Horizon f42ef42. Changing ordinary render distance now keeps departing detailed

@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.8";
+pub const VERSION: &str = "0.1.0+dormyu.9";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -2549,11 +2549,42 @@ pub mod engine {
                     }
                 }
             }
+            // A fully detailed tile was skipped by replan and has no published
+            // mask at all. After the near radius shrinks, its old detailed
+            // columns still stand in until their first far mesh is submitted.
+            // Checking the containing node at each level is bounded by nine
+            // lookups per old column, not columns times all wanted tiles.
+            for &(x, z) in &self.renderer_cutout {
+                if !covered.contains(&(x, z)) && self.awaiting_far_column(x, z) {
+                    covered.insert((x, z));
+                }
+            }
             if covered == self.renderer_cutout {
                 return None;
             }
             self.renderer_cutout = covered.clone();
             Some(covered)
+        }
+
+        fn awaiting_far_column(&self, x: i32, z: i32) -> bool {
+            for level in pos::SECTION_MINIMUM_DETAIL_LEVEL..=pos::ROOT_DETAIL_LEVEL {
+                let n = 1 << (level - 4);
+                let section = pos::encode(level, x.div_euclid(n), z.div_euclid(n));
+                if !self.wanted.contains(&section) {
+                    continue;
+                }
+                return match self.published_cutouts.get(&section) {
+                    None => true,
+                    Some(None) => false,
+                    Some(Some(mask)) => {
+                        let index = (x.rem_euclid(n) * n + z.rem_euclid(n)) as usize;
+                        mask.get(index / 64).is_some_and(|bits| bits & (1 << (index % 64)) != 0)
+                    }
+                };
+            }
+            // No wanted tile covers this column: it left DH's range, so it
+            // must not retain near GPU geometry indefinitely after movement.
+            false
         }
 
         pub fn host(&self) -> &H {
@@ -3953,11 +3984,10 @@ mod tests {
         let start = std::time::Instant::now();
         loop {
             let (meshes,_) = e.update([8.,8.],plan,near.clone());
-            if let Some(cutout) = e.take_cutout() {
-                if !cutout.contains(&(3,0)) {
-                    assert!(!meshes.is_empty(),"cutout must share its replacement mesh batch");
-                    break;
-                }
+            if let Some(cutout) = e.take_cutout()
+                && !cutout.contains(&(3,0)) {
+                assert!(!meshes.is_empty(),"cutout must share its replacement mesh batch");
+                break;
             }
             assert!(start.elapsed().as_secs() < 5,"departing near column retained forever");
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -3994,15 +4024,99 @@ mod tests {
         let start = std::time::Instant::now();
         loop {
             let (meshes,_) = e.update([8.,8.],coarse,near.clone());
-            if let Some(cutout) = e.take_cutout() {
-                if !cutout.contains(&(15,0)) {
-                    assert!(!meshes.is_empty(),"reused stale tile was not remeshed");
-                    break;
-                }
+            if let Some(cutout) = e.take_cutout()
+                && !cutout.contains(&(15,0)) {
+                assert!(!meshes.is_empty(),"reused stale tile was not remeshed");
+                break;
             }
             assert!(start.elapsed().as_secs() < 10,"quality reversal left a permanent stale hole");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn fully_near_tiles_keep_detail_until_their_first_far_mesh_after_near32_to8() {
+        use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
+        struct DelayedHost { blocks: BlockTable, gate: Arc<AtomicU8> }
+        impl Host for DelayedHost {
+            type Mesh = Vec<Quad>;
+            fn blocks(&self) -> &BlockTable { &self.blocks }
+            fn build_height(&self) -> (i32, i32) { (-64, 320) }
+            fn sampler(&self) -> Option<Box<dyn ColumnSampler>> { Some(Box::new(FakeSampler)) }
+            fn mesh(&self, _: i64, _: &FullDataSource, quads: &[Quad], _: bool) -> Vec<Quad> {
+                if self.gate.compare_exchange(1,2,Ordering::SeqCst,Ordering::SeqCst).is_ok() {
+                    let start = std::time::Instant::now();
+                    while self.gate.load(Ordering::SeqCst) == 2 && start.elapsed().as_secs() < 5 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                quads.to_vec()
+            }
+        }
+        let gate = Arc::new(AtomicU8::new(0));
+        let settings = engine::WorkSettings {
+            render: RenderSettings { cave_culling:false, cave_culling_height:60, min_y:-64 },
+            generation:true, debug:false,
+        };
+        let mut e = engine::Engine::new(DelayedHost { blocks:blocks(), gate:gate.clone() },None,1,settings,1);
+        let plan = DetailPlan::new(HorizontalQuality::Low,16);
+        let mut near = engine::Near { center:(0,0), radius:32, loaded:Default::default() };
+        near.loaded.extend((-32..=32).flat_map(|x| (-32..=32).map(move |z| (x,z))));
+        let (initial, _) = e.update([8.,8.],plan,near.clone());
+        assert!(initial.is_empty());
+        assert_eq!(e.stats().wanted,0,"the full near view must skip whole far tiles");
+        let mut published = e.take_cutout().expect("initial near coverage");
+        assert!(published.contains(&(12,0)) && published.contains(&(-13,0)));
+        assert!(published.contains(&(31,0)));
+        // These columns have no old far mesh or published mask. Shrinking
+        // creates their first job; a partial-hole remesh cannot test this case.
+        gate.store(1,Ordering::SeqCst);
+        near.radius = 8;
+        let previous = near.clone();
+        near.loaded.retain(|&(x,z)| previous.covers(x,z));
+        let start = std::time::Instant::now();
+        while gate.load(Ordering::SeqCst) != 2 {
+            e.update([8.,8.],plan,near.clone());
+            if let Some(cutout) = e.take_cutout() { published = cutout; }
+            assert!(start.elapsed().as_secs() < 5,"first far mesh never reached gate");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(published.contains(&(12,0)),"fully near tile lost its positive column");
+        assert!(published.contains(&(-13,0)),"fully near tile lost its negative column");
+        assert!(!published.contains(&(31,0)),"a column outside DH range retained its mesh");
+        std::thread::sleep(std::time::Duration::from_millis(650));
+        assert!(e.update([8.,8.],plan,near.clone()).0.is_empty());
+        assert!(e.take_cutout().is_none(),"detail left after the ordinary renderer fade");
+        gate.store(3,Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let mut waiting: std::collections::HashSet<_> = [(12,0),(-13,0)].into_iter().collect();
+        while !waiting.is_empty() {
+            let (meshes,_) = e.update([8.,8.],plan,near.clone());
+            if let Some(cutout) = e.take_cutout() {
+                waiting.retain(|&(x,z)| {
+                    if cutout.contains(&(x,z)) { return true; }
+                    let replacement = meshes.iter().find(|m| {
+                        pos::contains(m.section,pos::containing_block(6,x*16,z*16))
+                    }).expect("detail released without its first far mesh in this batch");
+                    let local_x = x*16 + 8 - pos::min_corner_block_x(replacement.section);
+                    let local_z = z*16 + 8 - pos::min_corner_block_z(replacement.section);
+                    assert!(replacement.mesh.as_ref().is_some_and(|quads| quads.iter().any(|q| {
+                        q.dir == Dir::Up && q.u0 <= local_x && local_x < q.u1
+                            && q.v0 <= local_z && local_z < q.v1
+                    })),"replacement still has a hole in the released column");
+                    false
+                });
+                published = cutout;
+            }
+            assert!(start.elapsed().as_secs() < 10,"first far mesh never released its stand-in");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!published.contains(&(12,0)) && !published.contains(&(-13,0)));
+        // Moving far away must also drop every retained column; only current
+        // wanted coverage may hold a near stand-in, never the travel history.
+        let elsewhere = engine::Near { center:(1000,1000), radius:8, loaded:Default::default() };
+        e.update([16008.,16008.],plan,elsewhere);
+        assert!(e.take_cutout().is_some_and(|cutout| cutout.is_empty()));
     }
 
     #[test]
