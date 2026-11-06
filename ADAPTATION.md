@@ -1,5 +1,27 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Coarse shore and canopy occupancy — 0.1.0+dormyu.13
+
+Reducing loaded terrain to a coarser tile previously kept any non-air child,
+even when the other three children contained known air. A lone shore protrusion
+or leaf column could therefore grow across the whole parent cell. This differed
+from Horizon's direct preview, which requires at least half the footprint to be
+occupied. Parent reduction now uses that same two-of-four threshold. Existing
+material tie ordering remains unchanged, and missing children remain missing.
+
+The counterfactual fixture fails on dormyu.12 for one occupied child out of four.
+It now passes for grass and opaque leaves at all four occupancy levels, while
+retaining the continuous water below and the data-completeness flags. All 34
+standalone tests and offline locked all-target Clippy with warnings denied pass.
+The cache fingerprint changes so old derived coarse columns are rebuilt; the
+saved data format, actual world chunks and terrain recipes are unchanged.
+The runtime version label now matches the package and mixin manifests.
+
+This establishes the reduction defect and its correction. It does not yet prove
+that it explains the remaining pale surface patches in the dormyu.12 screenshot.
+Fresh-world and reopened-world visual comparisons are required before accepting
+that material boundary. Local adaptation by dormyu; LGPL notices preserved.
+
 ## Dry banks beside lit water — 0.1.0+dormyu.12
 
 The dormyu.11 fresh-world check removed most submerged curtains but retained a

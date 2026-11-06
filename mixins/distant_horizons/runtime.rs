@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.10";
+pub const VERSION: &str = "0.1.0+dormyu.13";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -570,7 +570,8 @@ impl FullDataSource {
 /// `FullDataSourceV2.mergeInputTwoByTwoDataColumn`: the 2 x 2 columns at
 /// `(x, z)`, sliced at every height where one of them changes; each slice
 /// takes the most common non-air block, and the light of the columns that
-/// have that block.
+/// have that block. The local adaptation requires at least two occupied
+/// children, matching Horizon's direct-preview occupancy threshold.
 fn merge_two_by_two_column(input: &FullDataSource, x: i32, z: i32, blocks: &BlockTable) -> Vec<u64> {
     let columns: [&[u64]; 4] = [
         input.column(x, z),
@@ -654,9 +655,15 @@ fn merge_two_by_two_column(input: &FullDataSource, x: i32, z: i32, blocks: &Bloc
     out
 }
 
-/// `determineMostCommonValueInColumnSlice`: air never wins (it would hole
-/// hollow structures); ties go to the first column.
+/// `determineMostCommonValueInColumnSlice`, with Horizon's half-footprint
+/// occupancy rule: one shore/leaf column must not expand into all four.
+/// Known air wins below that threshold; occupied material ties still go to
+/// the first column. Missing children are rejected before this reduction.
 fn most_common_in_slice(ids: [u32; 4], mapping: &IdMap, blocks: &BlockTable) -> u32 {
+    let air = ids.map(|id| blocks.get(mapping.state(id)).air);
+    if air.iter().filter(|&&is_air| !is_air).count() < 2 {
+        return ids[air.iter().position(|&is_air| is_air).expect("mostly known air")];
+    }
     let mut counts = [0; 4];
     for &id in &ids {
         if blocks.get(mapping.state(id)).air {
@@ -3240,11 +3247,63 @@ mod tests {
                 )
             })
             .collect();
-        // Air never wins a slice: the one column of stone to 12 keeps it.
-        assert_eq!(runs, vec![(AIR, 12, 384), (STONE, 0, 12)]);
+        // One taller column must not raise the whole parent footprint.
+        assert_eq!(runs, vec![(AIR, 10, 384), (STONE, 0, 10)]);
         assert_eq!(parent.gen_steps[index(0, 0)], gen_step::LIGHT);
         // The other columns of the child were empty: left as they were.
         assert_eq!(parent.gen_steps[index(1, 0)], gen_step::EMPTY);
+    }
+
+    #[test]
+    fn coarse_shores_and_canopies_require_half_the_child_footprint() {
+        let mut b = blocks();
+        let leaves = b.states.len() as u32;
+        b.states.push(BlockInfo {
+            material: material::LEAVES,
+            ..b.states[GRASS as usize]
+        });
+        for cap in [GRASS, leaves] {
+            for occupied in 1..=4 {
+                let mut child = FullDataSource::empty(pos::encode(6, 0, 0));
+                for i in 0..4 {
+                    // A narrow shore protrusion or canopy occupies only part
+                    // of this 2x2 footprint. All columns retain real water
+                    // beneath it; air above is known data, not a missing tile.
+                    let biome = i as u16 + 1;
+                    let air = child.mapping.add_if_not_present(biome, AIR);
+                    let top = child.mapping.add_if_not_present(biome, cap);
+                    let water = child.mapping.add_if_not_present(1, WATER);
+                    let stone = child.mapping.add_if_not_present(1, STONE);
+                    let high = if i < occupied { 132 } else { 127 };
+                    let mut runs = vec![full_point::encode(air, 384 - high, high, 0, 15).unwrap()];
+                    if i < occupied {
+                        runs.push(full_point::encode(top, 5, 127, 0, 15).unwrap());
+                    }
+                    runs.extend([
+                        full_point::encode(water, 3, 124, 0, 15).unwrap(),
+                        full_point::encode(stone, 124, 0, 0, 0).unwrap(),
+                    ]);
+                    child.set_column(i & 1, i >> 1, runs, gen_step::LIGHT);
+                }
+                let mut parent = FullDataSource::empty(pos::encode(7, 0, 0));
+                assert!(parent.update_from(&child, &b));
+                let state_at = |y| {
+                    let p = parent.column(0, 0).iter().find(|&&p| {
+                        full_point::bottom_y(p) <= y && y < full_point::top_y(p)
+                    }).expect("known air, water and solid ranges remain represented");
+                    parent.mapping.state(full_point::id(*p))
+                };
+                assert_eq!(state_at(125), WATER, "continuous water is retained");
+                assert_eq!(
+                    state_at(130),
+                    if occupied >= 2 { cap } else { AIR },
+                    "{occupied}/4 occupied child columns must follow native preview occupancy"
+                );
+                assert_eq!(state_at(140), AIR);
+                assert_eq!(parent.gen_steps[index(0, 0)], gen_step::LIGHT);
+                assert_eq!(parent.gen_steps[index(1, 0)], gen_step::EMPTY);
+            }
+        }
     }
 
     #[test]
