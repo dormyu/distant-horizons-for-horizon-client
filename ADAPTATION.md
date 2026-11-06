@@ -1,5 +1,20 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Dry banks beside lit water — 0.1.0+dormyu.12
+
+The dormyu.11 fresh-world check removed most submerged curtains but retained a
+large shore-facing sheet after reducing ordinary distance from 32 to 8 chunks.
+The source bank was dry: its neighboring solid layer was submerged, so checking
+only water above the source did not suppress the legacy lit-border exception.
+
+Known submerged solid neighbors now occlude the buried part of a dry bank too.
+A counterfactual fixture reproduces a false Y=-64-to-70 wall against a lit bed
+at Y=61 with water at Y=63; only the real Y=61-to-70 exposed bank remains after
+the correction. This does not project unknown neighbors, alter terrain recipes,
+or change the saved data format. All 33 standalone tests and locked offline
+all-target Clippy pass. A new-world visual check is still required before this
+checkpoint can be considered installable. Local adaptation by dormyu.
+
 ## Lit underwater borders in a fresh world — 0.1.0+dormyu.11
 
 The dormyu.10 cold-cache check on existing chunks passed, but a fresh-world

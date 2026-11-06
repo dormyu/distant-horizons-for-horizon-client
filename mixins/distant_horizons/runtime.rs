@@ -1655,6 +1655,11 @@ fn side_segments(
         sky: 15,
         covered: false,
     }];
+    // A dry shoreline can face a wet neighbor. Its own column has no water,
+    // but the neighbor's submerged solid layers still hide the buried bank.
+    let adjacent_water_top = column.points.iter()
+        .filter(|&&p| render_point::material(p) == material::WATER)
+        .map(|&p| render_point::y_max(p)).max();
     let count = column.points.len() as isize;
     for adj_index in -1..count {
         let adj = if adj_index >= 0 {
@@ -1708,7 +1713,9 @@ fn side_segments(
             // can carry sky light down to that bed; exposing its covered side
             // invents a full-height curtain under otherwise continuous water.
             // Keep the existing above-ground detail-transition skirt policy.
-            let use_adj = on_border && lit && render_point::y_max(adj) >= at.cave_max_y && !same_fluid && !at.below_water;
+            let submerged_neighbor = adjacent_water_top.is_some_and(|water| adj_max <= water);
+            let use_adj = on_border && lit && render_point::y_max(adj) >= at.cave_max_y
+                && !same_fluid && !at.below_water && !submerged_neighbor;
             (if use_adj { adj_sky } else { SKYLIGHT_COVERED }, true)
         } else if transparent && is_same_transparent_block(adj, color, material) {
             (SKYLIGHT_COVERED, true)
@@ -3685,6 +3692,26 @@ mod tests {
         let edge: Vec<_> = quads.iter().filter(|q| q.dir == Dir::East && q.plane == 64).collect();
         assert_eq!(edge.len(), 1, "the exposed part of a real underwater cliff must remain");
         assert_eq!((edge[0].v0, edge[0].v1), (50, 61));
+    }
+
+    #[test]
+    fn a_dry_shore_does_not_expose_buried_ground_against_a_lit_wet_neighbor() {
+        let blocks = blocks();
+        let settings = RenderSettings { cave_culling: false, cave_culling_height: 60, min_y: -64 };
+        let mut source = FullDataSource::empty(pos::encode(6, 0, 0));
+        let column = column_from_runs(&mut source.mapping,
+            &[SampledRun { min: -64, max: 70, state: STONE, biome: 1, sky: 15, block: 0 }], -64, 320);
+        for x in 0..pos::WIDTH {
+            for z in 0..pos::WIDTH {
+                source.set_column(x, z, column.clone(), gen_step::LIGHT);
+            }
+        }
+        let render = RenderSource::from_full(&source, &blocks, &settings);
+        let wet = RenderSource::from_full(&lake_source(pos::encode(6, 1, 0), 61), &blocks, &settings);
+        let quads = build_quads(&render, [None, None, None, Some(&wet)], &settings, |_, _| false);
+        let edge: Vec<_> = quads.iter().filter(|q| q.dir == Dir::East && q.plane == 64).collect();
+        assert_eq!(edge.len(), 1, "the real exposed bank must remain: {edge:?}");
+        assert_eq!((edge[0].v0, edge[0].v1), (61, 70), "the solid neighbor occludes the buried bank");
     }
 
     #[test]
