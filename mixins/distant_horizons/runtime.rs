@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.13";
+pub const VERSION: &str = "0.1.0+dormyu.14";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -2116,6 +2116,90 @@ pub mod engine {
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
+
+    /// One owned session may finish joining its workers and saving derived data
+    /// away from the frame thread. A new session must wait for `ready`: even a
+    /// rapid off/on cannot create two writers for the same world cache.
+    pub struct Retirement<T: Send + 'static> {
+        sender: Option<std::sync::mpsc::SyncSender<T>>,
+        worker: Option<JoinHandle<()>>,
+        busy: Arc<AtomicBool>,
+        failed: Arc<AtomicBool>,
+    }
+
+    impl<T: Send + 'static> Retirement<T> {
+        pub fn new() -> std::io::Result<Self> {
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<T>(1);
+            let busy = Arc::new(AtomicBool::new(false));
+            let failed = Arc::new(AtomicBool::new(false));
+            let (working, failure) = (busy.clone(), failed.clone());
+            let worker = std::thread::Builder::new()
+                .name("Distant Horizons retirement".into())
+                .spawn(move || {
+                    while let Ok(value) = receiver.recv() {
+                        // Reset busy even when a destructor panics. Keep a
+                        // separate failure latch: do not reopen an uncertain
+                        // cache or silently treat an incomplete save as ready.
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))).is_err() {
+                            failure.store(true, Ordering::Release);
+                        }
+                        working.store(false, Ordering::Release);
+                    }
+                })?;
+            Ok(Self { sender: Some(sender), worker: Some(worker), busy, failed })
+        }
+
+        pub fn ready(&self) -> bool {
+            !self.busy()
+                && !self.failed()
+                && self.worker.as_ref().is_some_and(|worker| !worker.is_finished())
+        }
+
+        pub fn busy(&self) -> bool {
+            self.busy.load(Ordering::Acquire)
+        }
+
+        pub fn failed(&self) -> bool {
+            self.failed.load(Ordering::Acquire)
+        }
+
+        /// Never waits for the worker or for channel capacity. A rejected value
+        /// stays owned by the caller; it must not be dropped on a live frame.
+        pub fn try_retire(&mut self, value: T) -> Result<(), T> {
+            if !self.ready()
+                || self.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err()
+            {
+                return Err(value);
+            }
+            match self.sender.as_ref().expect("live retirement sender").try_send(value) {
+                Ok(()) => Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(value) | std::sync::mpsc::TrySendError::Disconnected(value)) => {
+                    self.failed.store(true, Ordering::Release);
+                    self.busy.store(false, Ordering::Release);
+                    Err(value)
+                }
+            }
+        }
+
+        /// Only the explicit application-exit hook may wait. Closing the sender
+        /// drains the accepted session before Windows tears its threads down.
+        pub fn finish(&mut self) -> bool {
+            self.sender.take();
+            if let Some(worker) = self.worker.take()
+                && worker.join().is_err()
+            {
+                self.failed.store(true, Ordering::Release);
+            }
+            self.busy.store(false, Ordering::Release);
+            !self.failed()
+        }
+    }
+
+    impl<T: Send + 'static> Drop for Retirement<T> {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
 
     /// A finished section mesh, or the news that a section has nothing to
     /// draw.
@@ -4627,6 +4711,137 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn retiring_a_busy_engine_does_not_wait_and_reopens_only_after_cache_flush() {
+        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
+        use std::time::{Duration, Instant};
+        struct BusyHost {
+            blocks: BlockTable,
+            first: AtomicBool,
+            entered: mpsc::Sender<()>,
+            release: Arc<Mutex<mpsc::Receiver<()>>>,
+        }
+        impl Host for BusyHost {
+            type Mesh = usize;
+            fn blocks(&self) -> &BlockTable { &self.blocks }
+            fn build_height(&self) -> (i32, i32) { (-64, 320) }
+            fn sampler(&self) -> Option<Box<dyn ColumnSampler>> { Some(Box::new(FakeSampler)) }
+            fn mesh(&self, _: i64, _: &FullDataSource, quads: &[Quad], _: bool) -> usize {
+                if self.first.swap(false, Ordering::AcqRel) {
+                    self.entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                quads.len()
+            }
+        }
+        let (entered, entry) = mpsc::channel();
+        let (release, waiting) = mpsc::channel();
+        let dir = std::env::temp_dir().join(format!("dh-retirement-{}", std::process::id()));
+        assert!(!dir.exists(), "retirement fixture must own a new directory");
+        let host = BusyHost { blocks: blocks(), first: AtomicBool::new(true), entered, release: Arc::new(Mutex::new(waiting)) };
+        let settings = engine::WorkSettings {
+            render: RenderSettings { cave_culling: false, cave_culling_height: 60, min_y: -64 },
+            generation: true, debug: false,
+        };
+        let mut e = engine::Engine::new(host, Some(dir.clone()), 1, settings, 1);
+        e.add_chunk(Box::new(FlatChunk { x: 0, z: 0, height: |_, _| 70 }));
+        let start = Instant::now();
+        while e.stats().chunks == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        e.update([8., 8.], DetailPlan::new(HorizontalQuality::Low, 8), engine::Near::default());
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut retiring = engine::Retirement::new().unwrap();
+        assert!(retiring.try_retire(e).is_ok());
+        // This is reached while the real mesh worker is still blocked. Joining
+        // Engine synchronously here would prevent us from releasing that worker.
+        assert!(retiring.busy());
+        assert!(!retiring.ready(), "rapid off/on must not start a second cache writer");
+        release.send(()).unwrap();
+        let start = Instant::now();
+        while !retiring.ready() {
+            assert!(!retiring.failed());
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Readiness follows the actual Engine destructor, including pending
+        // hierarchy propagation and persisted near data, not merely worker exit.
+        assert!(storage::load(&dir, pos::encode(6, 0, 0), 1).is_some());
+        // One visited chunk covers only part of the coarser hierarchy. Its
+        // immediate parent is valid; forcing a root-level record would turn
+        // incomplete children into invented terrain.
+        assert!(storage::load(&dir, pos::encode(7, 0, 0), 1).is_some());
+        assert!(retiring.finish());
+        let target = dir.canonicalize().unwrap();
+        let temporary_root = std::env::temp_dir().canonicalize().unwrap();
+        assert!(target.starts_with(&temporary_root) && target != temporary_root);
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    struct DropAction(Option<Box<dyn FnOnce() + Send>>);
+    impl Drop for DropAction {
+        fn drop(&mut self) {
+            if let Some(action) = self.0.take() { action(); }
+        }
+    }
+
+    #[test]
+    fn retirement_is_bounded_and_final_shutdown_drains_the_accepted_session() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
+        use std::time::Duration;
+        let (entered, entry) = mpsc::channel();
+        let (release, waiting) = mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let saved = finished.clone();
+        let first = DropAction(Some(Box::new(move || {
+            entered.send(()).unwrap();
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            saved.store(true, Ordering::Release);
+        })));
+        let rejected_dropped = Arc::new(AtomicBool::new(false));
+        let rejected_flag = rejected_dropped.clone();
+        let second = DropAction(Some(Box::new(move || { rejected_flag.store(true, Ordering::Release); })));
+        let mut retiring = engine::Retirement::new().unwrap();
+        assert!(retiring.try_retire(first).is_ok());
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        let rejected = match retiring.try_retire(second) {
+            Err(value) => value,
+            Ok(()) => panic!("retirement accepted a second outstanding session"),
+        };
+        assert!(!rejected_dropped.load(Ordering::Acquire));
+        let (closed, close) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            assert!(retiring.finish());
+            assert!(!retiring.ready());
+            closed.send(()).unwrap();
+        });
+        assert!(matches!(close.recv_timeout(Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)));
+        release.send(()).unwrap();
+        close.recv_timeout(Duration::from_secs(5)).unwrap();
+        shutdown.join().unwrap();
+        assert!(finished.load(Ordering::Acquire), "shutdown returned before the accepted save");
+        drop(rejected);
+        assert!(rejected_dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_retirement_panic_resets_busy_but_blocks_reopening_an_uncertain_cache() {
+        use std::time::{Duration, Instant};
+        let mut retiring = engine::Retirement::new().unwrap();
+        assert!(retiring.try_retire(DropAction(Some(Box::new(|| panic!("fixture save failure"))))).is_ok());
+        let start = Instant::now();
+        while retiring.busy() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(retiring.failed());
+        assert!(!retiring.ready());
+        assert!(retiring.try_retire(DropAction(None)).is_err());
+        assert!(!retiring.finish());
+        assert!(!retiring.busy());
     }
 
     #[test]

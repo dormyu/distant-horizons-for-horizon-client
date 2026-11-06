@@ -1,5 +1,33 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Background session retirement — 0.1.0+dormyu.14
+
+The dormyu.13 diagnostic client accepted `/dh off` immediately, but the next
+geometry status arrived 20.276 seconds later with only 13 additional frames.
+The frame path cleared the renderer, then synchronously dropped the engine:
+joining workers, propagating pending coarse data and saving dirty cache files.
+The relative cost of those phases and optimized-client latency were not measured.
+
+Session retirement now runs on one background worker. Its capacity-one channel
+uses nonblocking `try_send`; another session cannot start until the previous
+destructor and cache save have finished. This also serializes rapid off/on and
+world changes, so two DH engines cannot write the same cache concurrently.
+Renderer cleanup remains on the frame thread. Final application exit explicitly
+joins the retirement worker while the game's resources and Windows threads
+still exist, so exiting may wait for the accepted save to finish.
+
+A destructor panic resets the busy flag and latches a separate failure. New DH
+sessions then remain disabled until client restart. An unexpected enqueue
+failure retains ownership until final exit instead of dropping on a live frame.
+37 standalone tests and locked offline all-target Clippy pass. New regressions
+exercise a real busy Engine and its persisted parent data, bounded rejection of
+a second session, final-exit draining, and panic recovery without unsafe restart.
+
+No meshing, terrain, saved data format or geometry cache salt changes. Native
+client off/on latency, world changes and exit still need runtime verification;
+the standalone checks do not establish smoothness or installation acceptance.
+Local adaptation by dormyu; LGPL notices and upstream attribution preserved.
+
 ## Coarse shore and canopy occupancy — 0.1.0+dormyu.13
 
 Reducing loaded terrain to a coarser tile previously kept any non-air child,

@@ -11,7 +11,7 @@ use crate::game::Game;
 use crate::game::distant_horizons::{
     self as dh, BlockInfo, BlockTable, ChunkView, ColumnSampler, DetailPlan, Dir, FullDataSource, Host, Quad,
     RenderSettings, SampledRun, Settings,
-    engine::{Engine, Near, WorkSettings},
+    engine::{Engine, Near, Retirement, WorkSettings},
     material, pos,
 };
 use horizon_assets::model::Direction;
@@ -650,6 +650,8 @@ struct Session {
 
 thread_local! {
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+    static RETIREMENT: RefCell<Option<Retirement<Session>>> = const { RefCell::new(None) };
+    static RETIREMENT_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The settings, read once and kept up to date by the settings page.
     static SETTINGS: RefCell<Option<Settings>> = const { RefCell::new(None) };
     /// The LOD render distance in chunks while a session runs, else 0.
@@ -752,9 +754,9 @@ fn start(game: &mut Game<'_>, key: WorldKey, settings: &Settings) -> Session {
     }
 }
 
-/// Takes the session's tiles out of the renderer and ends it (its sections
-/// are saved as the engine stops).
-fn stop(game: &mut Game<'_>, session: Session) {
+/// Takes the old session's tiles out on the renderer's thread. Its worker join,
+/// pending reductions and cache save are separate from this visible cutover.
+fn clear_session(game: &mut Game<'_>, session: &Session) {
     // Release network waits before Engine::drop joins its workers.
     if session.key.remote {
         if let Some(remote) = &game.remote {
@@ -770,22 +772,71 @@ fn stop(game: &mut Game<'_>, session: Session) {
         renderer.clear_lods();
         log::debug!("Distant Horizons: cleared renderer ({shown} registered sections)");
     }
-    drop(session);
     RADIUS.set(0);
+}
+
+fn retirement_ready() -> bool {
+    if RETIREMENT_ERROR.get() {
+        return false;
+    }
+    RETIREMENT.with_borrow_mut(|slot| {
+        if slot.is_none() {
+            match Retirement::new() {
+                Ok(worker) => *slot = Some(worker),
+                Err(error) => {
+                    RETIREMENT_ERROR.set(true);
+                    log::error!("Distant Horizons: cannot start cache-retirement worker: {error}");
+                    return false;
+                }
+            }
+        }
+        let worker = slot.as_ref().expect("retirement worker initialized");
+        if worker.failed() {
+            RETIREMENT_ERROR.set(true);
+            log::error!("Distant Horizons: cache retirement failed; restart the client before enabling DH again");
+        }
+        worker.ready()
+    })
+}
+
+fn stop(game: &mut Game<'_>, session: Session) {
+    clear_session(game, &session);
+    let result = RETIREMENT.with_borrow_mut(|slot| {
+        slot.as_mut().expect("retirement created before live session").try_retire(session)
+    });
+    if let Err(session) = result {
+        // Do not turn an exceptional enqueue failure into the same frame stall.
+        // Keep ownership until the final exit hook, with DH disabled meanwhile.
+        RETIREMENT_ERROR.set(true);
+        SESSION.set(Some(session));
+        log::error!("Distant Horizons: could not retire cache; holding it safely until client exit");
+    }
 }
 
 /// End workers while Windows threads are still alive. A thread-local Session
 /// left to process teardown can otherwise join workers after ExitProcess has
 /// terminated them, producing std's unexpected-thread-termination panic.
 pub(super) fn shutdown(game: &mut Game<'_>) {
-    if let Some(session) = SESSION.take() {
-        stop(game, session);
+    let session = SESSION.take();
+    if let Some(session) = &session {
+        clear_session(game, session);
     }
+    // Game::shut_down runs after the event loop, not during an off/on frame.
+    // Complete every accepted save before resources and OS threads disappear.
+    if let Some(mut worker) = RETIREMENT.take()
+        && !worker.finish()
+    {
+        log::error!("Distant Horizons: cache retirement did not complete cleanly");
+    }
+    drop(session);
 }
 
 /// Once a frame (`native_frame`).
 pub(super) fn frame(game: &mut Game<'_>) {
     if !game.native_window() {
+        return;
+    }
+    if RETIREMENT_ERROR.get() {
         return;
     }
     let settings = settings(game);
@@ -808,6 +859,14 @@ pub(super) fn frame(game: &mut Game<'_>) {
         stop(game, s);
     }
     if !active {
+        return;
+    }
+    if !retirement_ready() {
+        // A previous world's immutable owned session may still be saving. Do
+        // not start another writer (or discard an exceptional retained session).
+        if let Some(session) = session {
+            SESSION.set(Some(session));
+        }
         return;
     }
     let mut session = session.unwrap_or_else(|| start(game, key, &settings));
