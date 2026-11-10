@@ -1,5 +1,50 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Verified renderer changes — 0.1.0+dormyu.17
+
+<!-- DH17-SELECTED-RENDERER-QA -->
+
+The frozen DH source `47888d3dec2edda918c367a5a60d3afc8f9f2fd0` passed the selected native functional, two-client,
+native 16 → 8 → 16 / DH 64 handoff and manual image checks described in
+[validation-dormyu.17.md](docs/validation-dormyu.17.md). Runtime SHA256:
+`a6a3fcfad445c5af67bf9a5e439d3512621e1cae296734b80e090c6f7ade6b07`. These results describe the compiled source; installation, Prism and
+release-download verification are recorded separately.
+
+Narrow predictive/native tree footprints retain supported stems independently of
+majority terrain reduction. Water top tint interpolation stitches selected coarse
+edges, tracks plan/data revisions and keeps uniform faces merged. Replanning skips
+identical selected tile sets; comparison indices avoid per-tile sorting. Coarse
+tint construction reads 512 boundary halo cells instead of 4356 full-field cells,
+with identical tested output; the rendered tile's own tint field remains full.
+
+The DHH2 cache format rebuilds derived DH data on first use while preserving saved
+chunks, player edits and IL recipes. **FPS/performance tests were omitted at the
+owner's request** (`performance_tested=false`), so this delivery has no new frame-rate
+or loading-time results. Interrupted attempts retain their original status.
+Visual QA uses native 16 → 8 → 16 / DH 64 Medium, 1080p and a 30 FPS cap. The owner's
+native 32 / DH 128 settings are preserved. IL 0.6.0 and Zoom 2 Rust bytes are unchanged.
+
+Source bundles require compilation into the pinned Horizon f42ef42 client, with
+privately prepared game resources. For the combined IL set use the complete
+[IL native-build tool instructions](https://github.com/dormyu/immersive-landscapes/blob/main/docs/native-build.md) and explicit `HORIZON_MIXINS_BIN`:
+both inert `recursion_limit` support and concrete `Self` constructor HEAD fixes
+are needed. The older DH-bundled patch covers only the former. Do not substitute
+it for IL's full patch or infer installation from a source bundle download.
+
+Visual review scope: Manual review of all twelve actual PNGs from the isolated same-candidate visual-02 world/cache: delta native16 to8 to16 and the original canopy camera, DH64 Medium,1920x1080,cap30. This is targeted renderer QA, not FPS or owner aesthetic acceptance.
+
+Remaining observed limits:
+
+- Underwater LOD still differs visibly in seabed detail, aquatic vegetation and lighting; the pale diagonal patch is a remaining renderer limitation, not a resolved water-tint defect.
+- Coarse distant vegetation, terrain steps and native biome material/colour boundaries remain visible. This check covers the selected cameras and does not certify every seed, distance or scene.
+- First-use DH cache rebuilding and newly explored terrain require preparation. Performance tests were explicitly omitted; no new FPS, frame-time,32/128 performance or heavy-pack guarantee is made.
+- The owner has not given aesthetic approval of this exact delivered candidate.
+
+The review covers the selected scenes; full-pack performance and owner aesthetic
+approval remain unverified. Original DH/Rust-port notices and the Horizon MIT
+notice remain intact. Historical entries below retain their original scope.
+
+
 ## Candidate dormyu.17 — narrow stems and water tint, 10 November 2026
 
 Not installed or visually accepted yet. The verified fallback is DormLab IL0.6.0
