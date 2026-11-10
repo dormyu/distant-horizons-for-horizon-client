@@ -2939,11 +2939,19 @@ pub mod engine {
             // Workers skip sections no longer wanted: they must see these
             // as wanted before their jobs are queued.
             *self.shared.wanted.lock().unwrap() = wanted.clone();
+            // Near coverage can change without changing the selected LOD tiles.
+            // In that case tint contexts are identical. Otherwise sort each
+            // plan once and compare borrowed key iterators, not two fresh
+            // scanned/sorted vectors for every surviving section.
+            let tint_plans = (self.plan.is_some() && wanted != self.wanted).then(|| {
+                (TintContextIndex::new(&self.wanted), TintContextIndex::new(&wanted))
+            });
             for &s in &wanted {
                 let shown = self.shown.contains(&s) || self.blank.contains(&s);
                 if self.plan.is_none() || (!self.wanted.contains(&s) && !shown) {
                     push(&self.shared, Job::Section(s), distance(s));
-                } else if coarser_tint_sources(s, &self.wanted) != coarser_tint_sources(s, &wanted)
+                } else if tint_plans.as_ref().is_some_and(|(before, after)|
+                    !before.sources_for(s).eq(after.sources_for(s)))
                     || (shown && (!self.published_cutouts.contains_key(&s)
                         || !same_cutout(
                             self.published_cutouts.get(&s).and_then(Option::as_ref),
@@ -3457,6 +3465,47 @@ pub mod engine {
         (0, -1), (0, 1), (-1, 0), (1, 0), (-1, -1), (1, -1), (-1, 1), (1, 1),
     ];
 
+    struct TintContextEntry {
+        key: i64,
+        detail: u8,
+        min: [i32; 2],
+        max: [i32; 2],
+    }
+
+    /// A frame-local comparison index; it does not replace the workers' plan
+    /// snapshot or data dependencies. Its order and inclusive bounds match
+    /// `coarser_tint_sources` exactly, including the plan-wide endpoint margin.
+    struct TintContextIndex {
+        margin: i32,
+        sources: Vec<TintContextEntry>,
+    }
+
+    impl TintContextIndex {
+        fn new(wanted: &HashSet<i64>) -> Self {
+            let margin = wanted.iter().map(|&p| pos::data_width(p)).max().unwrap_or(1) * 2;
+            let mut sources: Vec<_> = wanted.iter().map(|&key| {
+                let min = [pos::min_corner_block_x(key), pos::min_corner_block_z(key)];
+                let width = pos::block_width(key);
+                TintContextEntry { key, detail: pos::detail_level(key), min,
+                    max: [min[0] + width, min[1] + width] }
+            }).collect();
+            sources.sort_unstable_by_key(|p| (std::cmp::Reverse(p.detail), p.key));
+            Self { margin, sources }
+        }
+
+        fn sources_for(&self, s: i64) -> impl Iterator<Item = i64> + '_ {
+            let detail = pos::detail_level(s);
+            let (x, z) = (pos::min_corner_block_x(s), pos::min_corner_block_z(s));
+            let width = pos::block_width(s);
+            let bounds = [x - self.margin, z - self.margin,
+                x + width + self.margin, z + width + self.margin];
+            self.sources.iter().take_while(move |p| p.detail > detail)
+                .filter(move |p| p.min[0] <= bounds[2] && p.max[0] >= bounds[0]
+                    && p.min[1] <= bounds[3] && p.max[1] >= bounds[1])
+                .map(|p| p.key)
+        }
+    }
+
     /// Only selected coarse tiles can constrain a finer edge. The small margin
     /// covers successive coarser edge interpolation endpoints (their geometric
     /// series is less than twice the largest selected cell). No world sampling.
@@ -3631,6 +3680,73 @@ pub mod engine {
                 &[SampledRun { min: -64, max: 63, state: 1, biome, sky: 15, block: 0 }], -64, 320);
             for x in 0..64 { for z in 0..64 { source.set_column(x, z, column.clone(), gen_step::LIGHT); } }
             source
+        }
+
+        #[test]
+        fn tint_context_index_matches_worker_order_for_negative_mixed_detail_plans() {
+            let plan = DetailPlan::new(HorizontalQuality::Medium, 128).with_near_radius(32);
+            for player in [[-1408., -3456.], [-3072., 1056.], [128., 0.]] {
+                let wanted: HashSet<_> = plan.sections(player, |_| false).into_iter().collect();
+                let index = TintContextIndex::new(&wanted);
+                assert!(wanted.iter().any(|&s| pos::x(s) < 0 || pos::z(s) < 0));
+                for s in wanted.iter().copied().chain([
+                    pos::encode(6, -1, -1), pos::encode(8, -6, -14), pos::encode(14, 0, 0),
+                ]) {
+                    assert_eq!(index.sources_for(s).collect::<Vec<_>>(), coarser_tint_sources(s, &wanted),
+                        "sorted comparison index changed a context at {player:?}, section {s}");
+                }
+            }
+            let empty = HashSet::new();
+            assert_eq!(TintContextIndex::new(&empty).sources_for(pos::encode(6, -1, -1)).count(), 0);
+        }
+
+        #[test]
+        fn tint_context_index_keeps_plan_wide_margin_changes() {
+            let fine = pos::encode(6, -1, -1);
+            let nearby_coarse = pos::encode(7, 1, -1);
+            let distant_coarsest = pos::encode(14, 20, 20);
+            let before = HashSet::from([fine, nearby_coarse]);
+            let mut after = before.clone();
+            after.insert(distant_coarsest);
+            let old = TintContextIndex::new(&before);
+            let new = TintContextIndex::new(&after);
+            assert_eq!(old.margin, 4);
+            assert_eq!(new.margin, 512);
+            assert!(old.sources_for(fine).next().is_none());
+            assert_eq!(new.sources_for(fine).collect::<Vec<_>>(), [nearby_coarse]);
+            assert!(!old.sources_for(fine).eq(new.sources_for(fine)),
+                "even a distant selected tile can widen the endpoint margin");
+            assert_eq!(old.sources_for(fine).collect::<Vec<_>>(), coarser_tint_sources(fine, &before));
+            assert_eq!(new.sources_for(fine).collect::<Vec<_>>(), coarser_tint_sources(fine, &after));
+        }
+
+        #[test]
+        fn equal_selected_plan_skips_tint_remesh_but_preserves_near_cutout_changes() {
+            let plan = DetailPlan::new(HorizontalQuality::Medium, 128).with_near_radius(32);
+            let player = [-1408., -3456.];
+            let wanted: HashSet<_> = plan.sections(player, |_| false).into_iter().collect();
+            let target = *wanted.iter().find(|&&s| pos::data_width(s) <= 16).unwrap();
+            let chunk = (pos::min_corner_block_x(target) >> 4, pos::min_corner_block_z(target) >> 4);
+            let mut engine = Engine::new(host(0), None, 1, settings(), 1);
+            engine.shared.stop.store(true, Ordering::Relaxed);
+            engine.shared.ready.notify_all();
+            for worker in std::mem::take(&mut engine.threads) { worker.join().unwrap(); }
+            engine.wanted = wanted.clone();
+            engine.shown = wanted.clone();
+            engine.published_cutouts = wanted.iter().map(|&s| (s, None)).collect();
+            engine.plan = Some(plan);
+            *engine.shared.wanted.lock().unwrap() = wanted.clone();
+            engine.replan(player, plan, &Near::default());
+            {
+                let queue = engine.shared.queue.lock().unwrap();
+                assert!(queue.meshes.is_empty(), "an identical selected plan invented tint work");
+                assert!(queue.sections.is_empty());
+            }
+            let near = Near { center: chunk, radius: 1, loaded: HashSet::from([chunk]) };
+            engine.replan(player, plan, &near);
+            assert_eq!(engine.wanted, wanted, "one near chunk must not remove a whole LOD tile");
+            assert!(engine.shared.queue.lock().unwrap().meshes.contains(&target),
+                "the tint short-circuit must not suppress changed near coverage");
         }
 
         #[test]

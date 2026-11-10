@@ -597,14 +597,14 @@ impl Host for HorizonHost {
                     if water_grid.as_ref().is_none_or(|(height, _)| *height != q.plane) {
                         let mut coarser: Vec<WaterTintSource> = Vec::with_capacity(neighborhood.coarser.len());
                         for neighbor in neighborhood.coarser {
-                            let mut grid = water_tint_grid(neighbor.source, neighbor.neighbors, q.plane - 1,
+                            let mut grid = water_tint_grid(neighbor.source, neighbor.neighbors, true, q.plane - 1,
                                 self.layout.min_y(), |biome| self.context.biomes.get(biome).water);
                             let origin = [pos::min_corner_block_x(neighbor.source.pos), pos::min_corner_block_z(neighbor.source.pos)];
                             let stride = pos::data_width(neighbor.source.pos);
                             grid.stitch(origin, stride, &coarser);
                             coarser.push(WaterTintSource { origin, stride, grid });
                         }
-                        let mut grid = water_tint_grid(source, neighborhood.neighbors, q.plane - 1,
+                        let mut grid = water_tint_grid(source, neighborhood.neighbors, false, q.plane - 1,
                             self.layout.min_y(), |biome| self.context.biomes.get(biome).water);
                         grid.stitch([pos::min_corner_block_x(section), pos::min_corner_block_z(section)],
                             pos::data_width(section), &coarser);
@@ -642,11 +642,12 @@ impl Host for HorizonHost {
 fn water_tint_grid(
     source: &FullDataSource,
     neighbors: [Option<&FullDataSource>; 8],
+    perimeter_only: bool,
     y: i32,
     min_y: i32,
     color: impl Fn(u16) -> u32,
 ) -> WaterTintGrid {
-    WaterTintGrid::new(pos::WIDTH as usize, |x, z| {
+    let sample = |x, z| {
         let (data, x, z) = match (x, z) {
             (-1, -1) => (neighbors[4]?, pos::WIDTH - 1, pos::WIDTH - 1),
             (x, -1) if x == pos::WIDTH => (neighbors[5]?, 0, pos::WIDTH - 1),
@@ -663,7 +664,12 @@ fn water_tint_grid(
             let top = min_y + dh::full_point::top_y(p);
             (bottom <= y && y < top).then(|| color(data.mapping.get(dh::full_point::id(p)).0))
         })
-    })
+    };
+    if perimeter_only {
+        WaterTintGrid::perimeter(pos::WIDTH as usize, sample)
+    } else {
+        WaterTintGrid::new(pos::WIDTH as usize, sample)
+    }
 }
 
 #[derive(Clone, Copy)]

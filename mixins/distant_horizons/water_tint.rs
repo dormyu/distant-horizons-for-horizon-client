@@ -89,6 +89,44 @@ impl WaterTintGrid {
         Self { side, colors }
     }
 
+    /// Construct only the colours consumed by `WaterTintSource::edge_color`.
+    /// The interior is intentionally unknown and must not supply mesh faces.
+    /// Each needed halo cell is read once: 8*side reads for side >= 2 (512 for
+    /// a 64-cell tile), or 9 for side 1. Storage remains bounded by a full grid.
+    pub fn perimeter(side: usize, mut sample: impl FnMut(i32, i32) -> Option<u32>) -> Self {
+        assert!((1..=64).contains(&side));
+        let pitch = side + 2;
+        let mut cells = vec![None; pitch * pitch];
+        for z in 0..pitch {
+            if z < 2 || z >= side {
+                for x in 0..pitch {
+                    cells[z * pitch + x] = sample(x as i32 - 1, z as i32 - 1);
+                }
+            } else {
+                for x in [0, 1, side, side + 1] {
+                    cells[z * pitch + x] = sample(x as i32 - 1, z as i32 - 1);
+                }
+            }
+        }
+        let vertex = |x: usize, z: usize| mean([
+            cells[z * pitch + x],
+            cells[z * pitch + x + 1],
+            cells[(z + 1) * pitch + x],
+            cells[(z + 1) * pitch + x + 1],
+        ]);
+        let pitch = side + 1;
+        let mut colors = vec![None; pitch * pitch];
+        for x in 0..=side {
+            colors[x] = vertex(x, 0);
+            colors[side * pitch + x] = vertex(x, side);
+        }
+        for z in 1..side {
+            colors[z * pitch] = vertex(0, z);
+            colors[z * pitch + side] = vertex(side, z);
+        }
+        Self { side, colors }
+    }
+
     pub fn vertex(&self, x: usize, z: usize, fallback: u32) -> u32 {
         assert!(x <= self.side && z <= self.side);
         self.colors[z * (self.side + 1) + x].unwrap_or(fallback & 0xFF_FFFF)
@@ -175,6 +213,73 @@ mod tests {
 
     const COLD: u32 = 0x45_ADF2;
     const WARM: u32 = 0x43_D5EE;
+
+    #[test]
+    fn perimeter_matches_full_boundary_with_exact_unique_sample_bound() {
+        for side in [1, 2, 3, 8, 64] {
+            let at = |x: i32, z: i32| ((x - z).rem_euclid(5) != 0)
+                .then_some((x.wrapping_mul(127) ^ z.wrapping_mul(97)) as u32 & 0xFF_FFFF);
+            let full = WaterTintGrid::new(side, at);
+            let mut seen = std::collections::HashSet::new();
+            let perimeter = WaterTintGrid::perimeter(side, |x, z| {
+                assert!((-1..=side as i32).contains(&x) && (-1..=side as i32).contains(&z));
+                assert!(x <= 0 || z <= 0 || x >= side as i32 - 1 || z >= side as i32 - 1,
+                    "coarse construction read an unused interior cell");
+                assert!(seen.insert((x, z)), "halo cell was sampled more than once");
+                at(x, z)
+            });
+            assert_eq!(seen.len(), if side == 1 { 9 } else { 8 * side });
+            for z in 0..=side { for x in 0..=side {
+                let i = z * (side + 1) + x;
+                if x == 0 || z == 0 || x == side || z == side {
+                    assert_eq!(perimeter.colors[i], full.colors[i], "side={side}, vertex=({x},{z})");
+                } else {
+                    assert_eq!(perimeter.colors[i], None);
+                }
+            } }
+        }
+    }
+
+    #[test]
+    fn edge_color_reads_only_perimeter_at_negative_and_fractional_coordinates() {
+        for stride in [1, 4, 16] {
+            let at = |x: i32, z: i32| ((x + z).rem_euclid(7) != 0)
+                .then_some(if x - z < 2 { COLD } else { WARM });
+            let full = WaterTintSource { origin: [-768, -1792], stride, grid: WaterTintGrid::new(8, at) };
+            let edge = WaterTintSource { origin: full.origin, stride, grid: WaterTintGrid::perimeter(8, at) };
+            // Every world-block coordinate also exercises interpolated vertices,
+            // rejected interior points, outer corners and out-of-bounds queries.
+            for z in -1..=8 * stride + 1 { for x in -1..=8 * stride + 1 {
+                let point = [full.origin[0] + x, full.origin[1] + z];
+                assert_eq!(edge.edge_color(point), full.edge_color(point), "stride={stride}, point={point:?}");
+            } }
+        }
+    }
+
+    #[test]
+    fn perimeter_context_keeps_recursive_mixed_detail_vertices_and_quads_identical() {
+        let sample = |x: i32, z: i32| ((x + 3 * z).rem_euclid(13) != 0)
+            .then_some(if (x - 2 * z).rem_euclid(19) < 8 { COLD } else { WARM });
+        let contexts = |perimeter: bool| {
+            let mut sources = Vec::new();
+            for (origin, stride) in [([-1024, -1024], 16), ([0, -512], 8)] {
+                let at = |x, z| sample(origin[0] + x * stride, origin[1] + z * stride);
+                let mut grid = if perimeter { WaterTintGrid::perimeter(64, at) } else { WaterTintGrid::new(64, at) };
+                grid.stitch(origin, stride, &sources);
+                sources.push(WaterTintSource { origin, stride, grid });
+            }
+            sources
+        };
+        let full_context = contexts(false);
+        let edge_context = contexts(true);
+        let mut full = WaterTintGrid::new(64, sample);
+        let mut optimized = WaterTintGrid::new(64, sample);
+        full.stitch([0, 0], 4, &full_context);
+        optimized.stitch([0, 0], 4, &edge_context);
+        assert_eq!(optimized.colors, full.colors, "recursive coarse corners changed a fine colour");
+        assert_eq!(optimized.rectangles([0, 0, 64, 64], COLD), full.rectangles([0, 0, 64, 64], COLD),
+            "coarse-only optimization changed emitted geometry or colour order");
+    }
 
     #[test]
     fn whole_uniform_ocean_remains_one_quad_without_rounding_drift() {
