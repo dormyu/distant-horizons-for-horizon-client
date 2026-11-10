@@ -2630,6 +2630,16 @@ pub mod engine {
             self.next_mesh_revision = self.next_mesh_revision.wrapping_add(1);
             self.mesh_revisions.insert(section, self.next_mesh_revision);
         }
+        /// A delayed old job may reach its snapshot after a newer mesh. It must
+        /// not replace that mesh's dependency set merely because its own final
+        /// mesh will be rejected later. Caller also holds the store lock.
+        fn register_mesh_dependencies(&mut self, section: i64, revision: u64, dependencies: Vec<i64>) -> bool {
+            if self.mesh_revisions.get(&section) != Some(&revision) {
+                return false;
+            }
+            self.mesh_dependencies.insert(section, dependencies);
+            true
+        }
     }
 
     struct Store {
@@ -3498,7 +3508,12 @@ pub mod engine {
             }
             dependencies.sort_unstable();
             dependencies.dedup();
-            shared.queue.lock().unwrap().mesh_dependencies.insert(s, dependencies);
+            if !shared.queue.lock().unwrap().register_mesh_dependencies(s, revision, dependencies) {
+                // The newer request/data change owns the replacement. Queue
+                // bookkeeping is completed by work(); requeueing here would
+                // invalidate that replacement again and could starve it.
+                return;
+            }
             (source, neighbors, coarse_data)
         };
         let near = shared.near.lock().unwrap().clone();
@@ -3694,6 +3709,61 @@ pub mod engine {
             let queue = engine.shared.queue.lock().unwrap();
             assert!(changed.iter().all(|s| queue.meshes.contains(s)), "surviving mixed edges were not remeshed");
             assert!(unchanged.iter().all(|s| !queue.meshes.contains(s)), "unchanged ocean tiles were needlessly rebuilt");
+        }
+
+        #[test]
+        fn delayed_old_snapshot_cannot_replace_current_tint_dependencies_or_lose_queued_job() {
+            let fine = pos::encode(8, -8, -14);
+            let old_coarse = pos::encode(9, -5, -7);
+            let new_coarse = pos::encode(10, -3, -4);
+            let old_plan = HashSet::from([fine, old_coarse]);
+            let new_plan = HashSet::from([fine, new_coarse]);
+            let mut engine = Engine::new(host(fine), None, 1, settings(), 1);
+            engine.shared.stop.store(true, Ordering::Relaxed);
+            engine.shared.ready.notify_all();
+            for worker in std::mem::take(&mut engine.threads) { worker.join().unwrap(); }
+            engine.wanted = new_plan.clone();
+            *engine.shared.wanted.lock().unwrap() = new_plan.clone();
+            let old_revision = {
+                let mut queue = engine.shared.queue.lock().unwrap();
+                queue.invalidate_mesh(fine);
+                queue.mesh_revisions[&fine]
+            };
+            let mut delayed_dependencies = coarser_tint_sources(fine, &old_plan);
+            assert_eq!(delayed_dependencies, [old_coarse]);
+            delayed_dependencies.push(fine);
+            delayed_dependencies.sort_unstable();
+            // Old job captured revision/coarse keys and is delayed before its
+            // store snapshot. Replan queues a newer job with another halo.
+            push(&engine.shared, Job::Mesh(fine), 0);
+            let mut current_dependencies = coarser_tint_sources(fine, &new_plan);
+            assert_eq!(current_dependencies, [new_coarse]);
+            current_dependencies.push(fine);
+            current_dependencies.sort_unstable();
+            {
+                let _store = engine.shared.store.lock().unwrap();
+                let mut queue = engine.shared.queue.lock().unwrap();
+                let current_revision = queue.mesh_revisions[&fine];
+                assert_ne!(current_revision, old_revision);
+                assert!(queue.register_mesh_dependencies(fine, current_revision, current_dependencies.clone()));
+                let queued = queue.heap.len();
+                // Resume old registration after the current one, in the exact
+                // adverse order; rejection must not mutate current work.
+                assert!(!queue.register_mesh_dependencies(fine, old_revision, delayed_dependencies));
+                assert_eq!(queue.mesh_dependencies[&fine], current_dependencies);
+                assert_eq!(queue.mesh_revisions[&fine], current_revision);
+                assert_eq!(queue.heap.len(), queued);
+                assert!(queue.meshes.contains(&fine));
+                drop(queue);
+                invalidate_data_appearance(&engine.shared, new_coarse);
+                assert_ne!(engine.shared.queue.lock().unwrap().mesh_revisions[&fine], current_revision,
+                    "the retained current dependency must invalidate the fine mesh when it changes");
+            }
+            remesh_neighbors(&engine.shared, new_coarse);
+            let queue = engine.shared.queue.lock().unwrap();
+            assert!(queue.meshes.contains(&fine));
+            assert_eq!(queue.heap.iter().filter(|job| matches!(&job.job, Job::Mesh(s) if *s == fine)).count(), 1,
+                "old registration must neither strand nor duplicate the replacement");
         }
     }
 
