@@ -1,12 +1,10 @@
 # Distant Horizons for Horizon Client
 
-> Local dormyu.16 adaptation for Horizon f42ef42. Current changes, tests and limits:
-> [ADAPTATION.md](ADAPTATION.md). The upstream README below is historical.
-> The latest changes preserve visited terrain during partial LOD preparation and
-> remove invented boundary walls. Derived LOD caches are rebuilt on first use.
-> Regression checks pass; a fresh in-game comparison is still required.
-> This candidate is not an installed release.
-
+> Local dormyu.17 candidate for Horizon f42ef42: narrow far-tree stems and
+> interpolated water tint. See [ADAPTATION.md](ADAPTATION.md) for implementation,
+> attribution and evidence. Unit/data checks pass; current native runtime and
+> visual/performance validation are still pending. DormLab retains verified DH16
+> with Immersive Landscapes0.6.0 until the new candidate passes.
 
 > Historical integration note for dormyu's `0.1.0+dormyu.4` adaptation for Horizon
 > f42ef42. See [ADAPTATION.md](ADAPTATION.md) for changes, attribution and limits.

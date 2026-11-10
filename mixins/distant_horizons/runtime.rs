@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.16";
+pub const VERSION: &str = "0.1.0+dormyu.17";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -278,6 +278,8 @@ pub struct BlockInfo {
     pub snow_layer: bool,
     /// Frozen water: water directly under it is drawn as ice.
     pub ice: bool,
+    /// A native log/wood column whose one-block footprint must survive reduction.
+    pub stem: bool,
 }
 
 /// Every block state's `BlockInfo`, by state id. Unknown ids are air.
@@ -358,8 +360,29 @@ pub struct FullDataSource {
     pub columns: Vec<Vec<u64>>,
     /// Each column's `gen_step`.
     pub gen_steps: Vec<i8>,
+    /// Sparse exact footprints, independent of the terrain cell's width.
+    pub stems: Vec<Stem>,
     pub is_empty: bool,
 }
+
+/// Renderer-only one-block stem, with world X/Z and build-relative Y.
+/// Four adjacent records retain a real 2x2 trunk; reduction never widens them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Stem {
+    pub x: i32,
+    pub z: i32,
+    pub min_y: u16,
+    pub max_y: u16,
+    pub id: u32,
+    pub sky: u8,
+    pub block: u8,
+    /// Zero for exact native logs. Predicted roots require this surviving crown.
+    pub leaves: u32,
+    pub crown_max: u16,
+}
+
+const STEM_MAX_WIDTH: i32 = 16;
+const STEMS_PER_COLUMN: usize = 4;
 
 /// `FullDataSourceV2.relativePosToIndex`.
 pub fn index(x: i32, z: i32) -> usize {
@@ -377,6 +400,7 @@ impl FullDataSource {
             mapping: IdMap::default(),
             columns: vec![Vec::new(); COLUMNS],
             gen_steps: vec![gen_step::EMPTY; COLUMNS],
+            stems: Vec::new(),
             is_empty: true,
         }
     }
@@ -411,12 +435,13 @@ impl FullDataSource {
         let this_detail = pos::detail_level(self.pos);
         let input_detail = pos::detail_level(input.pos);
         let remapped = self.mapping.merge_and_remap(&input.mapping);
+        let mut accepted = Vec::new();
         let changed: Vec<usize> = if input_detail == this_detail {
-            self.update_from_same_detail_level(input, &remapped)
+            self.update_from_same_detail_level(input, &remapped, &mut accepted)
         } else if input_detail + 1 == this_detail {
-            self.update_from_one_below_detail_level(input, &remapped, blocks)
+            self.update_from_one_below_detail_level(input, &remapped, blocks, &mut accepted)
         } else if input_detail == this_detail + 1 {
-            self.downsample_from_one_above_detail_level(input, &remapped)
+            self.downsample_from_one_above_detail_level(input, &remapped, &mut accepted)
         } else {
             panic!(
                 "unsupported data source update: {} into {}",
@@ -424,7 +449,8 @@ impl FullDataSource {
                 pos::to_string(self.pos)
             );
         };
-        if changed.is_empty() {
+        let stems_changed = self.update_stems(input, &remapped, blocks, &accepted);
+        if changed.is_empty() && !stems_changed {
             return false;
         }
         self.remove_unused_ids_and_remap();
@@ -448,7 +474,7 @@ impl FullDataSource {
         true
     }
 
-    fn update_from_same_detail_level(&mut self, input: &FullDataSource, remapped: &[u32]) -> Vec<usize> {
+    fn update_from_same_detail_level(&mut self, input: &FullDataSource, remapped: &[u32], accepted: &mut Vec<usize>) -> Vec<usize> {
         let mut changed = Vec::new();
         for i in 0..COLUMNS {
             let this_step = if self.columns[i].is_empty() { gen_step::EMPTY } else { self.gen_steps[i] };
@@ -470,6 +496,7 @@ impl FullDataSource {
                 .iter()
                 .map(|&p| full_point::set_id(p, remapped[full_point::id(p) as usize]))
                 .collect();
+            accepted.push(i);
             if self.columns[i] != column || self.gen_steps[i] != input_step {
                 changed.push(i);
             }
@@ -492,6 +519,7 @@ impl FullDataSource {
         input: &FullDataSource,
         remapped: &[u32],
         blocks: &BlockTable,
+        accepted: &mut Vec<usize>,
     ) -> Vec<usize> {
         let half = pos::WIDTH / 2;
         let first = pos::child(self.pos, 0);
@@ -511,6 +539,14 @@ impl FullDataSource {
                     continue;
                 }
                 let recipient = index(x / 2 + offset_x, z / 2 + offset_z);
+                // A finer preview is still speculative. Never replace visited
+                // or feature-complete parent data (including removed trees)
+                // with a late SURFACE child merely because its cells are smaller.
+                let current_step = if self.columns[recipient].is_empty() {
+                    gen_step::EMPTY
+                } else { self.gen_steps[recipient] };
+                if step < current_step { continue; }
+                accepted.push(recipient);
                 let merged: Vec<u64> = merge_two_by_two_column(input, x, z, blocks)
                     .into_iter()
                     .map(|p| full_point::set_id(p, remapped[full_point::id(p) as usize]))
@@ -528,7 +564,7 @@ impl FullDataSource {
 
     /// `downsampleFromOneAboveDetailLevel`: fills only the columns that have
     /// no data, so higher-detail data is never covered.
-    fn downsample_from_one_above_detail_level(&mut self, input: &FullDataSource, remapped: &[u32]) -> Vec<usize> {
+    fn downsample_from_one_above_detail_level(&mut self, input: &FullDataSource, remapped: &[u32], accepted: &mut Vec<usize>) -> Vec<usize> {
         let half = pos::WIDTH / 2;
         let first = pos::child(input.pos, 0);
         let offset_x = if pos::x(self.pos) == pos::x(first) { 0 } else { half };
@@ -552,6 +588,7 @@ impl FullDataSource {
                     .map(|&p| full_point::set_id(p, remapped[full_point::id(p) as usize]))
                     .collect();
                 self.gen_steps[recipient] = gen_step::DOWN_SAMPLED;
+                accepted.push(recipient);
                 self.is_empty = false;
                 changed.push(recipient);
             }
@@ -572,12 +609,116 @@ impl FullDataSource {
                 });
             }
         }
+        for stem in &self.stems {
+            new_by_old.entry(stem.id).or_insert_with(|| {
+                let (biome, state) = self.mapping.get(stem.id);
+                fresh.add_if_not_present(biome, state)
+            });
+        }
         for column in &mut self.columns {
             for p in column.iter_mut() {
                 *p = full_point::set_id(*p, new_by_old[&full_point::id(*p)]);
             }
         }
         self.mapping = fresh;
+        for stem in &mut self.stems {
+            stem.id = new_by_old[&stem.id];
+        }
+    }
+
+    fn stem_column(&self, stem: &Stem) -> Option<usize> {
+        let width = pos::data_width(self.pos);
+        let x = (stem.x - pos::min_corner_block_x(self.pos)).div_euclid(width);
+        let z = (stem.z - pos::min_corner_block_z(self.pos)).div_euclid(width);
+        ((0..pos::WIDTH).contains(&x) && (0..pos::WIDTH).contains(&z)).then(|| index(x, z))
+    }
+
+    /// Bound physical footprints, not light-split vertical runs. A native2x2
+    /// trunk occupies four footprints even when each has many lighting bands.
+    pub fn normalize_stems(&mut self) {
+        if pos::data_width(self.pos) > STEM_MAX_WIDTH {
+            self.stems.clear();
+            return;
+        }
+        let mut roots = std::collections::BTreeMap::<(usize, i32, i32), Vec<Stem>>::new();
+        for &stem in &self.stems {
+            if stem.min_y < stem.max_y && stem.sky <= 15 && stem.block <= 15
+                && let Some(i) = self.stem_column(&stem) {
+                roots.entry((i, stem.x, stem.z)).or_default().push(stem);
+            }
+        }
+        let mut groups = Vec::new();
+        for ((i, x, z), mut spans) in roots {
+            if spans.iter().any(|s| s.leaves == 0) {
+                spans.retain(|s| s.leaves == 0);
+                spans.sort_unstable_by_key(|s| (s.min_y, s.max_y, s.id, s.sky, s.block));
+                let mut merged: Vec<Stem> = Vec::new();
+                for s in spans {
+                    if let Some(last) = merged.last_mut()
+                        && last.id == s.id && s.min_y <= last.max_y {
+                        last.max_y = last.max_y.max(s.max_y);
+                        last.crown_max = last.max_y;
+                        last.sky = last.sky.max(s.sky);
+                        last.block = last.block.max(s.block);
+                    } else { merged.push(s); }
+                }
+                spans = merged;
+            } else {
+                // Same root observed from several nearby input samples is one
+                // preview, not overlapping wood at identical X/Z.
+                spans.sort_unstable_by_key(|s| (std::cmp::Reverse(s.crown_max),
+                    std::cmp::Reverse(s.max_y - s.min_y), *s));
+                spans.truncate(1);
+            }
+            let lo = spans.iter().map(|s| s.min_y).min().unwrap();
+            let hi = spans.iter().map(|s| s.max_y).max().unwrap();
+            groups.push((i, std::cmp::Reverse(hi - lo), x, z, spans));
+        }
+        groups.sort_unstable_by_key(|(i, height, x, z, _)| (*i, *height, *x, *z));
+        self.stems.clear();
+        let (mut previous, mut count) = (usize::MAX, 0);
+        for (i, _, _, _, spans) in groups {
+            if i != previous { previous = i; count = 0; }
+            count += 1;
+            if count <= STEMS_PER_COLUMN { self.stems.extend(spans); }
+        }
+    }
+
+    fn exact_stems(&self, blocks: &BlockTable) -> Vec<Stem> {
+        let mut stems = self.stems.clone();
+        if pos::data_width(self.pos) != 1 { return stems; }
+        let (bx, bz) = (pos::min_corner_block_x(self.pos), pos::min_corner_block_z(self.pos));
+        for (i, column) in self.columns.iter().enumerate() {
+            if self.gen_steps[i] < gen_step::FEATURES { continue; }
+            for &p in column {
+                if blocks.get(self.mapping.state(full_point::id(p))).stem {
+                    stems.push(Stem {
+                        x: bx + i as i32 / pos::WIDTH, z: bz + i as i32 % pos::WIDTH,
+                        min_y: full_point::bottom_y(p) as u16, max_y: full_point::top_y(p) as u16,
+                        id: full_point::id(p), sky: full_point::sky_light(p), block: full_point::block_light(p),
+                        leaves: 0, crown_max: full_point::top_y(p) as u16,
+                    });
+                }
+            }
+        }
+        stems
+    }
+
+    fn update_stems(&mut self, input: &Self, remapped: &[u32], blocks: &BlockTable, accepted: &[usize]) -> bool {
+        if accepted.is_empty() { return false; }
+        let mut mask = [false; COLUMNS];
+        for &i in accepted { mask[i] = true; }
+        let before = self.stems.clone();
+        self.stems = self.stems.iter().copied().filter(|s|
+            self.stem_column(s).is_some_and(|i| !mask[i])).collect();
+        for mut stem in input.exact_stems(blocks) {
+            if self.stem_column(&stem).is_some_and(|i| mask[i]) {
+                stem.id = remapped[stem.id as usize];
+                self.stems.push(stem);
+            }
+        }
+        self.normalize_stems();
+        self.stems != before
     }
 }
 
@@ -899,6 +1040,8 @@ pub trait ColumnSampler: Send {
     }
     /// Begin a bounded sampling batch at this section's data spacing.
     fn begin_section(&mut self, _stride: i32) {}
+    /// Attach only metadata collected by this exact sampling batch.
+    fn finish_section(&mut self, _source: &mut FullDataSource) {}
     /// False means unavailable, not air (e.g. a refused server tile).
     fn try_column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) -> bool {
         self.column(x, z, out);
@@ -952,6 +1095,8 @@ fn generate_missing_where(
             filled += 1;
         }
     }
+    sampler.finish_section(source);
+    source.normalize_stems();
     filled
 }
 
@@ -1543,6 +1688,82 @@ fn known_column(column: &RenderColumn) -> Option<&RenderColumn> {
     (!column.points.is_empty() || column.void != render_point::EMPTY_DATA).then_some(column)
 }
 
+/// A predicted trunk is anchored only beneath its own surviving crown. LOD
+/// rounding may move either end by at most one cell; a lost crown is not a
+/// licence to create a freestanding pole or connect an unrelated neighbouring tree.
+pub fn stem_bounds(source: &FullDataSource, stem: &Stem, blocks: &BlockTable) -> Option<(i32, i32)> {
+    let i = source.stem_column(stem)?;
+    if source.column_is_missing(i) { return None; }
+    let (min, max) = (i32::from(stem.min_y), i32::from(stem.max_y));
+    if stem.leaves == 0 { return (min < max).then_some((min, max)); }
+    let column = &source.columns[i];
+    let crown = column.iter().filter(|&&p|
+        source.mapping.state(full_point::id(p)) == stem.leaves
+        && full_point::bottom_y(p) < i32::from(stem.crown_max)
+        && full_point::top_y(p) > max)
+        .map(|&p| full_point::bottom_y(p)).min()?;
+    let ground = column.iter().filter(|&&p| {
+        let block = blocks.get(source.mapping.state(full_point::id(p)));
+        !block.air && !block.liquid && !block.stem && block.material != material::LEAVES
+            && block.opacity == 16 && full_point::top_y(p) <= crown
+    }).map(|&p| full_point::top_y(p)).max()?;
+    let tolerance = pos::data_width(source.pos);
+    if (ground - min).abs() > tolerance || (crown - max).abs() > tolerance
+        || !(1..=64).contains(&(crown - ground)) { return None; }
+    if column.iter().any(|&p| {
+        blocks.get(source.mapping.state(full_point::id(p))).liquid
+            && full_point::top_y(p) > ground && full_point::bottom_y(p) < crown
+    }) { return None; }
+    Some((ground, crown))
+}
+
+/// At most six faces per visible exact one-block segment. These faces use the
+/// existing terrain upload, world-generation identity and near cutout lifecycle.
+pub fn append_stem_quads(
+    source: &FullDataSource, blocks: &BlockTable, min_y: i32,
+    cutout: impl Fn(i32, i32) -> bool, quads: &mut Vec<Quad>,
+) {
+    let width = pos::data_width(source.pos);
+    if !(2..=STEM_MAX_WIDTH).contains(&width) { return; }
+    let (bx, bz) = (pos::min_corner_block_x(source.pos), pos::min_corner_block_z(source.pos));
+    for stem in &source.stems {
+        let Some(i) = source.stem_column(stem) else { continue };
+        if cutout(i as i32 / pos::WIDTH, i as i32 % pos::WIDTH) { continue; }
+        let Some((bottom, top)) = stem_bounds(source, stem, blocks) else { continue };
+        let column = &source.columns[i];
+        let opaque = |p: u64| {
+            let info = blocks.get(source.mapping.state(full_point::id(p)));
+            !info.air && info.opacity == 16
+        };
+        // Avoid duplicate geometry where the reduced terrain already fills this
+        // interval, including a dense real2x2 stem retained by the majority vote.
+        let mut gaps = vec![(bottom, top)];
+        for &p in column.iter().filter(|&&p| opaque(p)) {
+            let (lo, hi) = (full_point::bottom_y(p), full_point::top_y(p));
+            gaps = gaps.into_iter().flat_map(|(a, b)| {
+                [(a < lo).then_some((a, b.min(lo))), (b > hi).then_some((a.max(hi), b))]
+                    .into_iter().flatten().filter(|(a, b)| a < b)
+            }).collect();
+            if gaps.is_empty() { break; }
+        }
+        let (x, z) = (stem.x - bx, stem.z - bz);
+        let covered = |y: i32| column.iter().any(|&p|
+            opaque(p) && full_point::bottom_y(p) <= y && y < full_point::top_y(p));
+        for (lo, hi) in gaps {
+            let mut face = |dir, plane, u0, v0, u1, v1| quads.push(Quad {
+                dir, plane, transparent: false, id: stem.id, sky: stem.sky, block: stem.block,
+                u0, v0, u1, v1, lower_top: false,
+            });
+            face(Dir::North, z, x, lo + min_y, x + 1, hi + min_y);
+            face(Dir::South, z + 1, x, lo + min_y, x + 1, hi + min_y);
+            face(Dir::West, x, z, lo + min_y, z + 1, hi + min_y);
+            face(Dir::East, x + 1, z, lo + min_y, z + 1, hi + min_y);
+            if !covered(hi) { face(Dir::Up, hi + min_y, x, z, x + 1, z + 1); }
+            if !covered(lo - 1) { face(Dir::Down, lo + min_y, x, z, x + 1, z + 1); }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BoxAt {
     width: i32,
@@ -1846,7 +2067,7 @@ pub mod storage {
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
 
-    const MAGIC: &[u8; 4] = b"DHH1";
+    const MAGIC: &[u8; 4] = b"DHH2";
 
     pub fn path(dir: &Path, section: i64) -> PathBuf {
         dir.join(pos::detail_level(section).to_string())
@@ -1869,6 +2090,17 @@ pub mod storage {
             for p in column {
                 raw.extend_from_slice(&p.to_le_bytes());
             }
+        }
+        raw.extend_from_slice(&(source.stems.len() as u32).to_le_bytes());
+        for s in &source.stems {
+            raw.extend_from_slice(&s.x.to_le_bytes());
+            raw.extend_from_slice(&s.z.to_le_bytes());
+            raw.extend_from_slice(&s.min_y.to_le_bytes());
+            raw.extend_from_slice(&s.max_y.to_le_bytes());
+            raw.extend_from_slice(&s.id.to_le_bytes());
+            raw.extend_from_slice(&[s.sky, s.block]);
+            raw.extend_from_slice(&s.leaves.to_le_bytes());
+            raw.extend_from_slice(&s.crown_max.to_le_bytes());
         }
         let mut out = MAGIC.to_vec();
         out.extend_from_slice(&fingerprint.to_le_bytes());
@@ -1918,6 +2150,26 @@ pub mod storage {
                 column.push(p);
             }
         }
+        let count = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        if count > super::COLUMNS * super::STEMS_PER_COLUMN * super::full_point::MAX_WORLD_Y_SIZE as usize { return None; }
+        for _ in 0..count {
+            let stem = super::Stem {
+                x: i32::from_le_bytes(take(4)?.try_into().ok()?),
+                z: i32::from_le_bytes(take(4)?.try_into().ok()?),
+                min_y: u16::from_le_bytes(take(2)?.try_into().ok()?),
+                max_y: u16::from_le_bytes(take(2)?.try_into().ok()?),
+                id: u32::from_le_bytes(take(4)?.try_into().ok()?),
+                sky: take(1)?[0], block: take(1)?[0],
+                leaves: u32::from_le_bytes(take(4)?.try_into().ok()?),
+                crown_max: u16::from_le_bytes(take(2)?.try_into().ok()?),
+            };
+            if stem.id as usize >= entries as usize || stem.min_y >= stem.max_y
+                || stem.sky > 15 || stem.block > 15 || source.stem_column(&stem).is_none()
+                || i32::from(stem.max_y) >= super::full_point::MAX_WORLD_Y_SIZE
+                || (stem.leaves != 0 && stem.max_y >= stem.crown_max) { return None; }
+            source.stems.push(stem);
+        }
+        if at != raw.len() { return None; }
         // Old prepare updates could carry LIGHT metadata with empty vectors.
         // Such columns are unavailable, not a proof of a completely air world.
         for (step,column) in source.gen_steps.iter_mut().zip(&source.columns) {
@@ -2104,6 +2356,18 @@ pub const DEBUG_DETAIL_LEVEL_COLORS: [u32; 13] = [
 
 /// What the engine needs of the game. Implemented on Horizon in bridge.rs,
 /// and on a small fake in the tests.
+pub struct TintNeighborhood<'a> {
+    pub source: &'a FullDataSource,
+    /// N, S, W, E, NW, NE, SW, SE at source's detail level.
+    pub neighbors: [Option<&'a FullDataSource>; 8],
+}
+
+pub struct MeshNeighborhood<'a> {
+    pub neighbors: [Option<&'a FullDataSource>; 8],
+    /// Selected, potentially touching coarser tiles, ordered coarsest first.
+    pub coarser: &'a [TintNeighborhood<'a>],
+}
+
 pub trait Host: Send + Sync + 'static {
     type Mesh: Send + 'static;
     fn blocks(&self) -> &BlockTable;
@@ -2113,6 +2377,23 @@ pub trait Host: Send + Sync + 'static {
     fn sampler(&self) -> Option<Box<dyn ColumnSampler>>;
     /// The faces of a section, made into the game's mesh.
     fn mesh(&self, section: i64, source: &FullDataSource, quads: &[Quad], debug: bool) -> Self::Mesh;
+    /// Existing halo data for tint interpolation; no generation is requested.
+    /// Order: N, S, W, E, NW, NE, SW, SE. Non-tint hosts keep the old API.
+    fn mesh_with_neighbors(
+        &self,
+        section: i64,
+        source: &FullDataSource,
+        quads: &[Quad],
+        debug: bool,
+        _neighborhood: MeshNeighborhood<'_>,
+    ) -> Self::Mesh {
+        self.mesh(section, source, quads, debug)
+    }
+    /// A host may subdivide colour transitions or emit material overlays.
+    /// Report those actual faces, while simpler hosts keep the input count.
+    fn mesh_quad_count(&self, _mesh: &Self::Mesh, input_quads: usize) -> usize {
+        input_quads
+    }
 }
 
 /// The LOD world (`DhClientLevel` with its `FullDataSourceProviderV2`,
@@ -2332,6 +2613,9 @@ pub mod engine {
         /// Globally increasing stamps prevent a removed/re-added section from
         /// accidentally accepting an old result with a reused local counter.
         mesh_revisions: HashMap<i64, u64>,
+        /// Section keys read for a mesh's tint halo, including missing data.
+        /// Registered under the store lock before a changed source can publish.
+        mesh_dependencies: HashMap<i64, Vec<i64>>,
         next_mesh_revision: u64,
         /// Sections queued to take their children's changes: which children
         /// (bit `child index`) changed.
@@ -2433,6 +2717,7 @@ pub mod engine {
                     remesh_after_section: HashSet::new(),
                     meshes: HashSet::new(),
                     mesh_revisions: HashMap::new(),
+                    mesh_dependencies: HashMap::new(),
                     next_mesh_revision: 0,
                     propagate: HashMap::new(),
                     chunks: HashMap::new(),
@@ -2648,12 +2933,12 @@ pub mod engine {
                 let shown = self.shown.contains(&s) || self.blank.contains(&s);
                 if self.plan.is_none() || (!self.wanted.contains(&s) && !shown) {
                     push(&self.shared, Job::Section(s), distance(s));
-                } else if shown
-                    && (!self.published_cutouts.contains_key(&s)
+                } else if coarser_tint_sources(s, &self.wanted) != coarser_tint_sources(s, &wanted)
+                    || (shown && (!self.published_cutouts.contains_key(&s)
                         || !same_cutout(
                             self.published_cutouts.get(&s).and_then(Option::as_ref),
                             near_sections.get(&s),
-                        ))
+                        )))
                 {
                     push(&self.shared, Job::Mesh(s), distance(s));
                 }
@@ -2669,8 +2954,9 @@ pub mod engine {
             self.wanted = wanted;
             {
                 let mut queue = self.shared.queue.lock().unwrap();
-                let Queue { mesh_revisions, sections, meshes, .. } = &mut *queue;
+                let Queue { mesh_revisions, mesh_dependencies, sections, meshes, .. } = &mut *queue;
                 mesh_revisions.retain(|s,_| self.wanted.contains(s) || sections.contains(s) || meshes.contains(s));
+                mesh_dependencies.retain(|s,_| mesh_revisions.contains_key(s));
             }
             self.near_sections = near_sections;
             self.plan = Some(plan);
@@ -2778,6 +3064,7 @@ pub mod engine {
                 let mut queue = self.shared.queue.lock().unwrap();
                 let sections: Vec<_> = queue.mesh_revisions.keys().copied().collect();
                 for section in sections { queue.invalidate_mesh(section); }
+                queue.mesh_dependencies.clear();
             }
             {
                 let mut store = self.shared.store.lock().unwrap();
@@ -2996,9 +3283,12 @@ pub mod engine {
     /// A completed neighbour changes side visibility even when this tile's
     /// own columns and the player's near cutout have not changed.
     fn remesh_neighbors<H: Host>(shared: &Shared<H>, s: i64) {
+        let mut affected: HashSet<_> = shared.queue.lock().unwrap().mesh_dependencies.iter()
+            .filter(|(target, dependencies)| **target != s && dependencies.binary_search(&s).is_ok())
+            .map(|(&target, _)| target).collect();
+        affected.extend(TINT_NEIGHBORS.map(|(dx, dz)| pos::adjacent(s, dx, dz)));
         let wanted = shared.wanted.lock().unwrap();
-        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let neighbor = pos::adjacent(s, dx, dz);
+        for neighbor in affected {
             if wanted.contains(&neighbor) {
                 push(shared, Job::Mesh(neighbor), 0);
             }
@@ -3043,8 +3333,12 @@ pub mod engine {
     /// The caller still schedules work through changed/prepare as before.
     fn invalidate_data_appearance<H: Host>(shared: &Shared<H>, section: i64) {
         let mut queue = shared.queue.lock().unwrap();
-        for (dx,dz) in [(0,0),(1,0),(-1,0),(0,1),(0,-1)] {
-            let affected=pos::adjacent(section,dx,dz);
+        let mut affected: HashSet<_> = queue.mesh_dependencies.iter()
+            .filter(|(_, dependencies)| dependencies.binary_search(&section).is_ok())
+            .map(|(&target, _)| target).collect();
+        affected.insert(section);
+        affected.extend(TINT_NEIGHBORS.map(|(dx, dz)| pos::adjacent(section, dx, dz)));
+        for affected in affected {
             // Never create bookkeeping for fully near/unrequested sections.
             if queue.mesh_revisions.contains_key(&affected) {
                 queue.invalidate_mesh(affected);
@@ -3055,15 +3349,10 @@ pub mod engine {
     /// Section `s` changed: its mesh and its neighbours' borders again, and
     /// its parent queued to take the change.
     fn changed<H: Host>(shared: &Shared<H>, s: i64) {
-        {
-            let wanted = shared.wanted.lock().unwrap();
-            for (dx, dz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
-                let n = pos::adjacent(s, dx, dz);
-                if wanted.contains(&n) {
-                    push(shared, Job::Mesh(n), 0);
-                }
-            }
+        if shared.wanted.lock().unwrap().contains(&s) {
+            push(shared, Job::Mesh(s), 0);
         }
+        remesh_neighbors(shared, s);
         if pos::detail_level(s) >= pos::ROOT_DETAIL_LEVEL {
             return;
         }
@@ -3154,6 +3443,38 @@ pub mod engine {
         }
     }
 
+    const TINT_NEIGHBORS: [(i32, i32); 8] = [
+        (0, -1), (0, 1), (-1, 0), (1, 0), (-1, -1), (1, -1), (-1, 1), (1, 1),
+    ];
+
+    /// Only selected coarse tiles can constrain a finer edge. The small margin
+    /// covers successive coarser edge interpolation endpoints (their geometric
+    /// series is less than twice the largest selected cell). No world sampling.
+    fn coarser_tint_sources(s: i64, wanted: &HashSet<i64>) -> Vec<i64> {
+        let margin = wanted.iter().map(|&p| pos::data_width(p)).max().unwrap_or(1) * 2;
+        let (x, z) = (pos::min_corner_block_x(s), pos::min_corner_block_z(s));
+        let width = pos::block_width(s);
+        let mut sources: Vec<_> = wanted.iter().copied().filter(|&p| {
+            if pos::detail_level(p) <= pos::detail_level(s) { return false; }
+            let (px, pz) = (pos::min_corner_block_x(p), pos::min_corner_block_z(p));
+            let pw = pos::block_width(p);
+            px <= x + width + margin && px + pw >= x - margin
+                && pz <= z + width + margin && pz + pw >= z - margin
+        }).collect();
+        sources.sort_unstable_by_key(|&p| (std::cmp::Reverse(pos::detail_level(p)), p));
+        sources
+    }
+
+    fn tint_neighbors<H: Host>(shared: &Shared<H>, store: &mut Store, s: i64, dependencies: &mut Vec<i64>)
+        -> [Option<Arc<FullDataSource>>; 8]
+    {
+        TINT_NEIGHBORS.map(|(dx, dz)| {
+            let key = pos::adjacent(s, dx, dz);
+            dependencies.push(key);
+            cached_neighbor(shared, store, key)
+        })
+    }
+
     fn mesh<H: Host>(shared: &Shared<H>, s: i64) {
         let Some(revision) = shared.queue.lock().unwrap().mesh_revisions.get(&s).copied() else {
             // The section left the current plan before this job started.
@@ -3161,34 +3482,57 @@ pub mod engine {
         };
         let settings = *shared.settings.lock().unwrap();
         let blocks = shared.host.blocks();
-        let (source, neighbors) = {
+        let coarse_keys = coarser_tint_sources(s, &shared.wanted.lock().unwrap());
+        let (source, neighbors, coarse_data) = {
             let mut store = shared.store.lock().unwrap();
+            let mut dependencies = vec![s];
             let source = section(shared, &mut store, s);
-            let neighbors = [(0, -1), (0, 1), (-1, 0), (1, 0)]
-                .map(|(dx, dz)| cached_neighbor(shared, &mut store, pos::adjacent(s, dx, dz)));
-            (source, neighbors)
+            let neighbors = tint_neighbors(shared, &mut store, s, &mut dependencies);
+            let mut coarse_data = Vec::new();
+            for key in coarse_keys {
+                dependencies.push(key);
+                if let Some(data) = cached_neighbor(shared, &mut store, key) {
+                    let halo = tint_neighbors(shared, &mut store, key, &mut dependencies);
+                    coarse_data.push((data, halo));
+                }
+            }
+            dependencies.sort_unstable();
+            dependencies.dedup();
+            shared.queue.lock().unwrap().mesh_dependencies.insert(s, dependencies);
+            (source, neighbors, coarse_data)
         };
         let near = shared.near.lock().unwrap().clone();
         let render = RenderSource::from_full(&source, blocks, &settings.render);
-        let neighbors = neighbors.map(|n| n.map(|n| RenderSource::from_full(&n, blocks, &settings.render)));
+        let render_neighbors: [Option<RenderSource>; 4] = std::array::from_fn(|i| {
+            neighbors[i].as_ref().map(|n| RenderSource::from_full(n, blocks, &settings.render))
+        });
         let width = pos::data_width(s);
         let (bx, bz) = (pos::min_corner_block_x(s), pos::min_corner_block_z(s));
         let cutout = |x: i32, z: i32| {
             width <= 16 && near.covers((bx + x * width + width / 2) >> 4, (bz + z * width + width / 2) >> 4)
         };
-        let quads = build_quads(
+        let mut quads = build_quads(
             &render,
-            neighbors.each_ref().map(Option::as_ref),
+            render_neighbors.each_ref().map(Option::as_ref),
             &settings.render,
             cutout,
         );
-        let mesh = (!quads.is_empty()).then(|| shared.host.mesh(s, &source, &quads, settings.debug));
+        append_stem_quads(&source, blocks, settings.render.min_y, cutout, &mut quads);
+        let coarser: Vec<_> = coarse_data.iter().map(|(source, neighbors)| TintNeighborhood {
+            source, neighbors: neighbors.each_ref().map(|n| n.as_deref()),
+        }).collect();
+        let mesh = (!quads.is_empty()).then(|| shared.host.mesh_with_neighbors(
+            s, &source, &quads, settings.debug, MeshNeighborhood {
+                neighbors: neighbors.each_ref().map(|n| n.as_deref()), coarser: &coarser,
+            },
+        ));
+        let quad_count = mesh.as_ref().map_or(0, |mesh| shared.host.mesh_quad_count(mesh, quads.len()));
         shared.done.lock().unwrap().push(Meshed {
             section: s,
             mesh,
             cutout: near.section_mask(s),
             revision,
-            quad_count: quads.len(),
+            quad_count,
         });
     }
 
@@ -3223,6 +3567,133 @@ pub mod engine {
         };
         for source in pending {
             let _ = storage::save(dir, &source, shared.fingerprint);
+        }
+    }
+
+    #[cfg(test)]
+    mod water_tint_tests {
+        use super::*;
+
+        struct TintHost {
+            blocks: BlockTable,
+            held: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+            target: i64,
+        }
+        impl Host for TintHost {
+            type Mesh = u16;
+            fn blocks(&self) -> &BlockTable { &self.blocks }
+            fn build_height(&self) -> (i32, i32) { (-64, 320) }
+            fn sampler(&self) -> Option<Box<dyn ColumnSampler>> { None }
+            fn mesh(&self, _: i64, _: &FullDataSource, _: &[Quad], _: bool) -> u16 { 0 }
+            fn mesh_with_neighbors(&self, s: i64, _: &FullDataSource, _: &[Quad], _: bool, neighborhood: MeshNeighborhood<'_>) -> u16 {
+                if s != self.target { return 0; }
+                let biome = neighborhood.coarser.first().and_then(|n| n.source.column(0, 0).first()
+                    .map(|&p| n.source.mapping.get(full_point::id(p)).0)).unwrap_or(0);
+                if biome == 13 && !self.release.load(Ordering::SeqCst) {
+                    self.held.store(true, Ordering::SeqCst);
+                    while !self.release.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(1)); }
+                }
+                biome
+            }
+        }
+        fn host(target: i64) -> TintHost {
+            TintHost {
+                blocks: BlockTable { states: vec![
+                    BlockInfo { air: true, material: material::AIR, ..BlockInfo::default() },
+                    BlockInfo { solid: true, opacity: 16, alpha: 255, material: material::STONE, ..BlockInfo::default() },
+                ] },
+                held: Arc::new(AtomicBool::new(false)), release: Arc::new(AtomicBool::new(false)), target,
+            }
+        }
+        fn settings() -> WorkSettings {
+            WorkSettings { render: RenderSettings { cave_culling: false, cave_culling_height: 60, min_y: -64 },
+                generation: false, debug: false }
+        }
+        fn terrain(s: i64, biome: u16) -> FullDataSource {
+            let mut source = FullDataSource::empty(s);
+            let column = column_from_runs(&mut source.mapping,
+                &[SampledRun { min: -64, max: 63, state: 1, biome, sky: 15, block: 0 }], -64, 320);
+            for x in 0..64 { for z in 0..64 { source.set_column(x, z, column.clone(), gen_step::LIGHT); } }
+            source
+        }
+
+        #[test]
+        fn changed_coarse_tint_invalidates_held_fine_mesh_and_publishes_replacement() {
+            let fine = pos::encode(8, -6, -14);
+            let coarse = pos::encode(9, -4, -7);
+            let h = host(fine);
+            let (held, release) = (h.held.clone(), h.release.clone());
+            let mut engine = Engine::new(h, None, 1, settings(), 1);
+            struct Release(Arc<AtomicBool>);
+            impl Drop for Release { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+            let _release_on_drop = Release(release.clone());
+            engine.wanted = HashSet::from([fine, coarse]);
+            *engine.shared.wanted.lock().unwrap() = engine.wanted.clone();
+            {
+                let mut store = engine.shared.store.lock().unwrap();
+                store.sections.insert(fine, Arc::new(terrain(fine, 0)));
+                store.sections.insert(coarse, Arc::new(terrain(coarse, 13)));
+            }
+            engine.shared.queue.lock().unwrap().invalidate_mesh(fine);
+            let plan = DetailPlan::new(HorizontalQuality::Medium, 128);
+            let player = [-1408., -3456.];
+            engine.plan = Some(plan);
+            engine.planned_at = Some((Instant::now(), player));
+            let old_shared = engine.shared.clone();
+            let old_mesh = std::thread::spawn(move || mesh(&old_shared, fine));
+            let started = Instant::now();
+            while !held.load(Ordering::SeqCst) {
+                assert!(started.elapsed() < Duration::from_secs(5), "fine mesh did not read its coarse tint source");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(apply(&engine.shared, coarse, &terrain(coarse, 60)));
+            changed(&engine.shared, coarse);
+            let mut replacement = false;
+            let started = Instant::now();
+            while !replacement || engine.stats().queued != 0 {
+                for mesh in engine.update(player, plan, Near::default()).0 {
+                    replacement |= mesh.section == fine && mesh.mesh == Some(60);
+                    assert!(!(mesh.section == fine && mesh.mesh == Some(13)));
+                }
+                assert!(started.elapsed() < Duration::from_secs(10), "changed coarse data did not publish a fine replacement");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            release.store(true, Ordering::SeqCst);
+            old_mesh.join().unwrap();
+            assert!(!engine.update(player, plan, Near::default()).0.iter()
+                .any(|mesh| mesh.section == fine && mesh.mesh == Some(13)), "stale old tint overwrote the replacement");
+            assert!(!engine.shared.queue.lock().unwrap().mesh_dependencies.is_empty());
+            engine.wipe();
+            assert!(engine.shared.queue.lock().unwrap().mesh_dependencies.is_empty(), "world wipe retained tint dependencies");
+            let other_world = Engine::new(host(fine), None, 2, settings(), 1);
+            assert!(other_world.shared.queue.lock().unwrap().mesh_dependencies.is_empty(), "another world inherited tint state");
+        }
+
+        #[test]
+        fn moving_detail_plan_remeshes_only_surviving_tiles_whose_coarse_context_changed() {
+            let plan = DetailPlan::new(HorizontalQuality::Medium, 128).with_near_radius(32);
+            let before: HashSet<_> = plan.sections([0., 0.], |_| false).into_iter().collect();
+            let after: HashSet<_> = plan.sections([128., 0.], |_| false).into_iter().collect();
+            let changed: Vec<_> = before.intersection(&after).copied()
+                .filter(|&s| coarser_tint_sources(s, &before) != coarser_tint_sources(s, &after)).collect();
+            let unchanged: Vec<_> = before.intersection(&after).copied()
+                .filter(|&s| coarser_tint_sources(s, &before) == coarser_tint_sources(s, &after)).collect();
+            assert!(!changed.is_empty() && !unchanged.is_empty(), "fixture must exercise both outcomes");
+            let mut engine = Engine::new(host(0), None, 1, settings(), 1);
+            // Inspect actual replan queueing without racing a background mesh.
+            engine.shared.stop.store(true, Ordering::Relaxed);
+            engine.shared.ready.notify_all();
+            for worker in std::mem::take(&mut engine.threads) { worker.join().unwrap(); }
+            engine.wanted = before.clone();
+            engine.shown = before.clone();
+            engine.published_cutouts = before.iter().map(|&s| (s, None)).collect();
+            engine.plan = Some(plan);
+            *engine.shared.wanted.lock().unwrap() = before;
+            engine.replan([128., 0.], plan, &Near::default());
+            let queue = engine.shared.queue.lock().unwrap();
+            assert!(changed.iter().all(|s| queue.meshes.contains(s)), "surviving mixed edges were not remeshed");
+            assert!(unchanged.iter().all(|s| !queue.meshes.contains(s)), "unchanged ocean tiles were needlessly rebuilt");
         }
     }
 

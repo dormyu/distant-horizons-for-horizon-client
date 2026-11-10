@@ -8,9 +8,10 @@
 // Part of Distant Horizons for Horizon Client, LGPL-3.0 (see runtime.rs).
 
 use crate::game::Game;
+use crate::game::distant_horizons_water_tint::{WaterTintGrid, WaterTintSource};
 use crate::game::distant_horizons::{
     self as dh, BlockInfo, BlockTable, ChunkView, ColumnSampler, DetailPlan, Dir, FullDataSource, Host, Quad,
-    RenderSettings, SampledRun, Settings,
+    MeshNeighborhood, RenderSettings, SampledRun, Settings,
     engine::{Engine, Near, Retirement, WorkSettings},
     material, pos,
 };
@@ -96,6 +97,7 @@ fn block_table(facts: &horizon_client::blocks::BlockFacts) -> BlockTable {
                 alpha: if see_through { 0xA0 } else { 255 },
                 snow_layer: name == "snow",
                 ice,
+                stem: horizon_client::distant_horizons_stem_capture::is_stem(name),
             }
         })
         .collect();
@@ -110,7 +112,7 @@ fn fingerprint(facts: &horizon_client::blocks::BlockFacts) -> u64 {
     // Old partial preparation erased visited columns, and their reductions
     // may have propagated nonempty but incomplete coarse data. Rebuild only
     // derived LOD files; gameplay chunks and player edits stay intact.
-    "dormyu-sparse-prepare-v4-f42ef42".hash(&mut h);
+    "dormyu-stem-footprints-v5-f42ef42".hash(&mut h);
     for s in &facts.states {
         s.name.hash(&mut h);
     }
@@ -174,6 +176,8 @@ struct Sampler {
     tiles: HashMap<(i32, i32), Vec<horizon_client::lod::Column>>,
     refinement: Arc<Mutex<Refinement>>,
     build_height: (i32, i32),
+    stems: Vec<horizon_client::distant_horizons_stem_capture::Candidate>,
+    blocks: Arc<BlockTable>,
 }
 
 /// One shared native decoration builder, independent of the DH sampling workers.
@@ -305,6 +309,35 @@ impl ColumnSampler for Sampler {
     fn begin_section(&mut self, stride: i32) {
         self.stride = stride;
         self.tiles.clear(); // at most 64 half-stride tiles for one DH section
+        self.stems.clear();
+    }
+    fn finish_section(&mut self, source: &mut FullDataSource) {
+        let width = pos::data_width(source.pos);
+        if width > 16 { self.stems.clear(); return; }
+        let (bx, bz) = (pos::min_corner_block_x(source.pos), pos::min_corner_block_z(source.pos));
+        let (min_y, max_y) = self.build_height;
+        for candidate in self.stems.drain(..) {
+            let x = (candidate.x - bx).div_euclid(width);
+            let z = (candidate.z - bz).div_euclid(width);
+            if !(0..pos::WIDTH).contains(&x) || !(0..pos::WIDTH).contains(&z)
+                || source.gen_steps[dh::index(x, z)] != dh::gen_step::SURFACE
+                || candidate.min < min_y || candidate.max > max_y || candidate.crown_max > max_y
+                || candidate.min >= candidate.max { continue; }
+            let id = source.mapping.add_if_not_present(candidate.biome, candidate.log);
+            let mut stem = dh::Stem {
+                x: candidate.x, z: candidate.z,
+                min_y: (candidate.min - min_y) as u16, max_y: (candidate.max - min_y) as u16,
+                id, sky: candidate.sky, block: candidate.block,
+                leaves: if candidate.exact { 0 } else { candidate.leaves },
+                crown_max: (candidate.crown_max - min_y) as u16,
+            };
+            if !candidate.exact {
+                let Some((min, max)) = dh::stem_bounds(source, &stem, &self.blocks) else { continue; };
+                stem.min_y = min as u16;
+                stem.max_y = max as u16;
+            }
+            source.stems.push(stem);
+        }
     }
     fn column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) {
         Self::runs(&self.inner.column(x, z), out);
@@ -319,7 +352,13 @@ impl ColumnSampler for Sampler {
         let tz = z.div_euclid(tile_size) * tile_size;
         let columns = self.tiles.entry((tx, tz)).or_insert_with(|| {
             self.refinement.lock().unwrap().request_tile(tx, tz, sample_stride);
-            self.inner.grid(tx, tz, sample_stride, 16)
+            let capture = (self.stride <= 16)
+                .then(horizon_client::distant_horizons_stem_capture::Capture::start);
+            let columns = self.inner.grid(tx, tz, sample_stride, 16);
+            if columns.len() == 256 && let Some(capture) = capture {
+                self.stems.extend(capture.finish());
+            }
+            columns
         });
         // A refusal or cancellation stays missing, never becomes permanent air.
         if columns.len() != 256 {
@@ -358,7 +397,7 @@ struct Style {
 struct HorizonHost {
     layout: ColumnLayout,
     context: Arc<WorkerContext>,
-    blocks: BlockTable,
+    blocks: Arc<BlockTable>,
     /// The world generator, once the game has one to give.
     source: Mutex<Option<Arc<dyn LodSource>>>,
     styles: Mutex<HashMap<(u32, u8), [Option<Style>; 2]>>,
@@ -490,10 +529,25 @@ impl Host for HorizonHost {
             tiles: HashMap::new(),
             refinement: self.refinement.clone(),
             build_height: (self.layout.min_y(), self.layout.max_y()),
+            stems: Vec::new(),
+            blocks: self.blocks.clone(),
         }))
     }
     fn mesh(&self, section: i64, source: &FullDataSource, quads: &[Quad], debug: bool) -> SectionMesh {
+        self.mesh_with_neighbors(section, source, quads, debug, MeshNeighborhood { neighbors: [None; 8], coarser: &[] })
+    }
+    fn mesh_with_neighbors(
+        &self,
+        section: i64,
+        source: &FullDataSource,
+        quads: &[Quad],
+        debug: bool,
+        neighborhood: MeshNeighborhood<'_>,
+    ) -> SectionMesh {
         let mut mesh = SectionMesh::default();
+        // merge_quads groups faces by direction and height. Keep only one
+        // height's small tint field, rather than allocating one per water layer.
+        let mut water_grid: Option<(i32, WaterTintGrid)> = None;
         let detail = usize::from(pos::detail_level(section) - pos::SECTION_MINIMUM_DETAIL_LEVEL);
         let debug_color = dh::DEBUG_DETAIL_LEVEL_COLORS[detail.min(dh::DEBUG_DETAIL_LEVEL_COLORS.len() - 1)];
         for q in quads {
@@ -523,14 +577,11 @@ impl Host for HorizonHost {
                         Tint::Constant(c) => c,
                     }
                 };
-                let channel = |shift: u32| (((rgb >> shift) & 255) as f32 * shade) as u32;
-                let color = channel(16) | channel(8) << 8 | channel(0) << 16 | 0xFF00_0000;
-                // Keep the same fluid-face material tags as detailed chunks;
-                // Horizon shader packs otherwise treat distant water as solid.
-                let color = if style.fluid {
-                    fluid_face(color, direction(q.dir) as usize)
-                } else {
-                    color
+                let pack_color = |rgb: u32| {
+                    let channel = |shift: u32| (((rgb >> shift) & 255) as f32 * shade) as u32;
+                    let color = channel(16) | channel(8) << 8 | channel(0) << 16 | 0xFF00_0000;
+                    // Preserve fluid-face tags for Horizon shader packs.
+                    if style.fluid { fluid_face(color, direction(q.dir) as usize) } else { color }
                 };
                 let (plane, rect) = q.geometry();
                 let face = Face {
@@ -538,18 +589,84 @@ impl Host for HorizonHost {
                     plane,
                     layer: style.layer,
                     light,
-                    color,
+                    color: pack_color(rgb),
                     translucent: style.translucent || q.transparent,
                     fluid: style.fluid,
                 };
-                emit(&mut mesh, face, rect);
+                if !debug && q.dir == Dir::Up && matches!(style.tint, Tint::Water) {
+                    if water_grid.as_ref().is_none_or(|(height, _)| *height != q.plane) {
+                        let mut coarser: Vec<WaterTintSource> = Vec::with_capacity(neighborhood.coarser.len());
+                        for neighbor in neighborhood.coarser {
+                            let mut grid = water_tint_grid(neighbor.source, neighbor.neighbors, q.plane - 1,
+                                self.layout.min_y(), |biome| self.context.biomes.get(biome).water);
+                            let origin = [pos::min_corner_block_x(neighbor.source.pos), pos::min_corner_block_z(neighbor.source.pos)];
+                            let stride = pos::data_width(neighbor.source.pos);
+                            grid.stitch(origin, stride, &coarser);
+                            coarser.push(WaterTintSource { origin, stride, grid });
+                        }
+                        let mut grid = water_tint_grid(source, neighborhood.neighbors, q.plane - 1,
+                            self.layout.min_y(), |biome| self.context.biomes.get(biome).water);
+                        grid.stitch([pos::min_corner_block_x(section), pos::min_corner_block_z(section)],
+                            pos::data_width(section), &coarser);
+                        water_grid = Some((q.plane, grid));
+                    }
+                    let grid = &water_grid.as_ref().expect("water tint grid").1;
+                    let width = pos::data_width(section);
+                    let bounds = [q.u0, q.v0, q.u1, q.v1].map(|v| (v / width) as usize);
+                    for tinted in grid.rectangles(bounds, rgb) {
+                        let rect = tinted.bounds.map(|v| (v as i32 * width) as f32);
+                        let colors = tinted.colors.map(pack_color);
+                        if colors.iter().all(|&c| c == colors[0]) {
+                            emit(&mut mesh, Face { color: colors[0], ..face }, rect);
+                        } else {
+                            // A transition is at most one LOD cell wide (<=256
+                            // blocks), below the tiled-UV MAX_FACE bound.
+                            emit_colored_quad(&mut mesh, &face, rect, colors);
+                        }
+                    }
+                } else {
+                    emit(&mut mesh, face, rect);
+                }
             }
         }
         mesh.sort_solid();
         mesh
     }
+    fn mesh_quad_count(&self, mesh: &SectionMesh, _input_quads: usize) -> usize {
+        (mesh.solid.len() + mesh.translucent.len()) / 4
+    }
 }
 
+/// Read colour at the water face's own height from retained full data. This is
+/// not a request for detail generation and does not approximate world geometry.
+fn water_tint_grid(
+    source: &FullDataSource,
+    neighbors: [Option<&FullDataSource>; 8],
+    y: i32,
+    min_y: i32,
+    color: impl Fn(u16) -> u32,
+) -> WaterTintGrid {
+    WaterTintGrid::new(pos::WIDTH as usize, |x, z| {
+        let (data, x, z) = match (x, z) {
+            (-1, -1) => (neighbors[4]?, pos::WIDTH - 1, pos::WIDTH - 1),
+            (x, -1) if x == pos::WIDTH => (neighbors[5]?, 0, pos::WIDTH - 1),
+            (-1, z) if z == pos::WIDTH => (neighbors[6]?, pos::WIDTH - 1, 0),
+            (x, z) if x == pos::WIDTH && z == pos::WIDTH => (neighbors[7]?, 0, 0),
+            (x, -1) => (neighbors[0]?, x, pos::WIDTH - 1),
+            (x, z) if z == pos::WIDTH => (neighbors[1]?, x, 0),
+            (-1, z) => (neighbors[2]?, pos::WIDTH - 1, z),
+            (x, z) if x == pos::WIDTH => (neighbors[3]?, 0, z),
+            (x, z) => (source, x, z),
+        };
+        data.column(x, z).iter().find_map(|&p| {
+            let bottom = min_y + dh::full_point::bottom_y(p);
+            let top = min_y + dh::full_point::top_y(p);
+            (bottom <= y && y < top).then(|| color(data.mapping.get(dh::full_point::id(p)).0))
+        })
+    })
+}
+
+#[derive(Clone, Copy)]
 struct Face {
     dir: Dir,
     plane: f32,
@@ -582,6 +699,10 @@ fn emit(mesh: &mut SectionMesh, face: Face, [u0, v0, u1, v1]: [f32; 4]) {
 /// the same corner order and winding, and block-tiled UVs counted from the
 /// face's corner.
 fn emit_quad(mesh: &mut SectionMesh, face: &Face, [u0, v0, u1, v1]: [f32; 4]) {
+    emit_colored_quad(mesh, face, [u0, v0, u1, v1], [face.color; 4]);
+}
+
+fn emit_colored_quad(mesh: &mut SectionMesh, face: &Face, [u0, v0, u1, v1]: [f32; 4], colors: [u32; 4]) {
     let p = face.plane;
     let mut points = match face.dir {
         Dir::Up | Dir::Down => [[u0, p, v1], [u1, p, v1], [u1, p, v0], [u0, p, v0]],
@@ -605,12 +726,12 @@ fn emit_quad(mesh: &mut SectionMesh, face: &Face, [u0, v0, u1, v1]: [f32; 4]) {
     } else {
         &mut mesh.solid
     };
-    out.extend(points.into_iter().zip(uvs).map(|(pos, uv)| {
+    out.extend(points.into_iter().zip(uvs).zip(colors).map(|((pos, uv), color)| {
         TerrainVertex::tiled(
             pos,
             [uv[0] - corner[0], uv[1] - corner[1]],
             face.layer,
-            face.color,
+            color,
             face.light,
         )
     }));
@@ -721,7 +842,7 @@ fn start(game: &mut Game<'_>, key: WorldKey, settings: &Settings) -> Session {
     let host = HorizonHost {
         layout: game.world.layout(),
         context: game.pack.context.clone(),
-        blocks,
+        blocks: Arc::new(blocks),
         source: Mutex::new(source),
         styles: Mutex::new(HashMap::new()),
         refinement: Arc::new(Mutex::new(Refinement {

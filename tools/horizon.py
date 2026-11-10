@@ -232,7 +232,7 @@ def bundle_files():
     files = {"horizon-native.json": (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()}
     # Carry the upstream licenses and modification notice with the source bundle.
     for name in ("LICENSE", "COPYING.GPL", "ADAPTATION.md", "compatibility.json",
-                 "tools/patches/horizon-mixins-f42-compat.patch", "third-party/horizon-mixins-LICENSE"):
+                 "tools/patches/horizon-mixins-f42-compat.patch", "third-party/horizon-mixins-LICENSE", "third-party/horizon-LICENSE"):
         files[name] = (ROOT / name).read_bytes()
     for path in sorted(BUNDLE.iterdir()):
         if path.suffix in (".rs", ".toml"):

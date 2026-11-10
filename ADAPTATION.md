@@ -1,5 +1,50 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Candidate dormyu.17 — narrow stems and water tint, 10 November 2026
+
+Not installed or visually accepted yet. The verified fallback is DormLab IL0.6.0
+with DH16, runtime4d7c4fec, published on10November. This renderer candidate keeps
+IL's saved recipes and the native blocks unchanged.
+
+Four observed jungle crowns were reproduced from the sampled generator and its
+stride4 input: all7 contributing tall roots were missed before reduction.
+Renderer-only metadata now retains exact predictive root positions around the
+same native sampler call, independently of majority terrain columns. A preview
+stem is one block wide (the existing predictor's conservative footprint), must
+have its own surviving high crown and dry opaque support, and can adjust either
+endpoint by at most one LOD cell. The known root whose own crown vanished is
+rejected. Native cached/visited logs are captured before reduction; their exact
+one-block footprints jointly retain native2x2 trees. Lighting bands do not spend
+separate footprint slots. At most4 physical footprints per cell, through width16;
+coarser terrain keeps the existing approximation. No broad wooden LOD pillars are
+introduced by the extra faces. Existing majority-reduced geometry is unchanged.
+
+The sparse metadata shares data completeness, near cutouts, storage and mesh
+revision lifecycles. The new DHH2 derived cache/fingerprint requires initial LOD
+repreparation; ordinary saved chunks and player edits are untouched. A reproduced
+late SURFACE child replacing a LIGHT parent is now refused. Real edits at equal
+or greater completeness remain allowed.
+
+Water top colours interpolate existing data and retain merged uniform faces.
+Fine boundaries stitch to the actually selected coarser tile's edge, with halo
+and plan dependencies preventing stale colour meshes. This does not prove the
+cause of every pale underwater patch. Reported face counts use emitted vertices.
+
+Current checks:46 core tests,12 footprint regressions,3 capture/lifecycle tests
+and Clippy pass;7 pure water-helper tests pass separately. On195 vertices of three
+saved mixed-detail boundaries, RGB mismatch10/5/10 becomes<=0.5 from8-bit rounding,
+with unchanged interiors and only small rectangle-count increases. These are
+bounded code/data checks, not current gameplay/performance acceptance. New runtime,
+matched screenshots, startup/restart/near-far/two-client and FPS checks still pending.
+Local evidence: RustCore/qa/far-canopy-2026-11-10.
+
+Attribution: the tree-choice observer in capture_vegetation.rs adapts the MIT
+Horizon f42ef42 predictor by Ludovic Marie and Horizon contributors. The original
+MIT notice is shipped as third-party/horizon-LICENSE. Dormyu wrote the sparse
+metadata, integration and corrections. Original DH/Rust-port notices and LGPL
+remain unchanged; this is not an upstream release.
+
+
 ## Verified IL 0.5.0 integration — 6 November 2026
 
 Combined Horizon f42ef42 / IL224a831 / DH623dd71 / official Zoom725ff7a client

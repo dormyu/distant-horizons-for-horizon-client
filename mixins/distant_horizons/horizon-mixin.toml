@@ -1,6 +1,6 @@
 [mod]
 id = "distant_horizons"
-version = "0.1.0+dormyu.16"
+version = "0.1.0+dormyu.17"
 priority = 100
 
 # The commit it was built and tested on. Besides the native hook points it
@@ -22,6 +22,46 @@ id = "bridge"
 file = "crates/horizon-client/src/game.rs"
 name = "distant_horizons_bridge"
 source = "bridge.rs"
+
+[[module]]
+id = "water_tint"
+file = "crates/horizon-client/src/game.rs"
+name = "distant_horizons_water_tint"
+source = "water_tint.rs"
+
+[[module]]
+id = "stem_capture"
+file = "crates/horizon-client/src/client_lib.rs"
+name = "distant_horizons_stem_capture"
+source = "stem_capture.rs"
+visibility = "pub"
+
+[[injection]]
+id = "capture_vegetation"
+kind = "HEAD"
+target = "horizon_client_lib::vanillagen::lod::vegetation::Vegetation::apply"
+helper = "capture_vegetation.rs"
+bindings = [
+  { name = "vegetation", ty = "&crate::vanillagen::lod::vegetation::Vegetation", value = "self" },
+  { name = "column", ty = "&crate::lod::Column", value = "column" },
+  { name = "x", ty = "i32", value = "x" },
+  { name = "z", ty = "i32", value = "z" },
+  { name = "width", ty = "i32", value = "width" },
+  { name = "light", ty = "u16", value = "light" },
+]
+
+[[injection]]
+id = "capture_cached_stems"
+kind = "HEAD"
+target = "horizon_client_lib::vanillagen::lod::<VanillaLodSampler as LodSampler>::grid"
+helper = "capture_cached_stems.rs"
+bindings = [
+  { name = "sampler", ty = "&crate::vanillagen::lod::VanillaLodSampler", value = "self" },
+  { name = "x", ty = "i32", value = "x" },
+  { name = "z", ty = "i32", value = "z" },
+  { name = "width", ty = "i32", value = "width" },
+  { name = "side", ty = "usize", value = "side" },
+]
 
 [[injection]]
 id = "frame"
