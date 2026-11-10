@@ -1,6 +1,6 @@
 [mod]
 id = "distant_horizons"
-version = "0.1.0+dormyu.17"
+version = "0.1.0+dormyu.18"
 priority = 100
 
 # The commit it was built and tested on. Besides the native hook points it

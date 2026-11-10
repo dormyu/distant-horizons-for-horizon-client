@@ -112,7 +112,7 @@ fn fingerprint(facts: &horizon_client::blocks::BlockFacts) -> u64 {
     // Old partial preparation erased visited columns, and their reductions
     // may have propagated nonempty but incomplete coarse data. Rebuild only
     // derived LOD files; gameplay chunks and player edits stay intact.
-    "dormyu-stem-footprints-v5-f42ef42".hash(&mut h);
+    "dormyu-water-skylight-v6-f42ef42".hash(&mut h);
     for s in &facts.states {
         s.name.hash(&mut h);
     }
@@ -212,7 +212,7 @@ impl Refinement {
             }
         }
     }
-    fn drain(&mut self, min_y: i32, max_y: i32) -> Vec<FullDataSource> {
+    fn drain(&mut self, min_y: i32, max_y: i32, blocks: &BlockTable) -> Vec<FullDataSource> {
         if !self.enabled
             || self
                 .last_poll
@@ -238,7 +238,7 @@ impl Refinement {
             for z in 0..16 {
                 for x in 0..16 {
                     runs.clear();
-                    Sampler::runs(&columns[z * 16 + x], &mut runs);
+                    Sampler::runs(&columns[z * 16 + x], &mut runs, blocks);
                     let values = dh::column_from_runs(&mut source.mapping, &runs, min_y, max_y);
                     source.set_column(ox + x as i32, oz + z as i32, values, dh::gen_step::FEATURES);
                 }
@@ -262,7 +262,8 @@ impl Refinement {
     }
 }
 impl Sampler {
-    fn runs(column: &horizon_client::lod::Column, out: &mut Vec<SampledRun>) {
+    fn runs(column: &horizon_client::lod::Column, out: &mut Vec<SampledRun>, blocks: &BlockTable) {
+        let start = out.len();
         out.extend(column.spans.iter().map(|span| SampledRun {
             min: i32::from(span.min),
             max: i32::from(span.max),
@@ -271,6 +272,7 @@ impl Sampler {
             sky: ((span.light >> 4) & 15) as u8,
             block: ((span.light >> 12) & 15) as u8,
         }));
+        dh::shade_open_water(&mut out[start..], blocks);
     }
 }
 impl ColumnSampler for Sampler {
@@ -304,7 +306,7 @@ impl ColumnSampler for Sampler {
         self.refinement
             .lock()
             .unwrap()
-            .drain(self.build_height.0, self.build_height.1)
+            .drain(self.build_height.0, self.build_height.1, &self.blocks)
     }
     fn begin_section(&mut self, stride: i32) {
         self.stride = stride;
@@ -340,7 +342,7 @@ impl ColumnSampler for Sampler {
         }
     }
     fn column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) {
-        Self::runs(&self.inner.column(x, z), out);
+        Self::runs(&self.inner.column(x, z), out, &self.blocks);
     }
     fn try_column(&mut self, x: i32, z: i32, out: &mut Vec<SampledRun>) -> bool {
         // Summarise an area, rather than inflating one arbitrary rock/leaf into
@@ -369,7 +371,7 @@ impl ColumnSampler for Sampler {
         let iz = ((z - self.stride / 2 - tz) / sample_stride) as usize;
         let columns: &[horizon_client::lod::Column; 256] = columns.as_slice().try_into().unwrap();
         let reduced = horizon_client::lod::Column::reduced(columns, ix, iz, scale as usize);
-        Self::runs(&reduced, out);
+        Self::runs(&reduced, out, &self.blocks);
         true
     }
 }

@@ -18,7 +18,7 @@
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "distant_horizons";
 pub const NAME: &str = "Distant Horizons";
-pub const VERSION: &str = "0.1.0+dormyu.17";
+pub const VERSION: &str = "0.1.0+dormyu.18";
 pub const DESCRIPTION: &str = "Distant Horizons' level-of-detail terrain, ported to Rust: the world past your render distance, built from the chunks you visit and the world generator, kept on disk and drawn at lower detail the farther it is.";
 
 /// Horizon's default clear atmosphere ends at 1024 blocks unless its built-in
@@ -1025,6 +1025,35 @@ pub struct SampledRun {
     pub biome: u16,
     pub sky: u8,
     pub block: u8,
+}
+
+/// Restore native open-water skylight at the sampler boundary. Horizon's
+/// saved-column decoder deliberately makes water AND its floor fullbright,
+/// while generated columns and loaded gameplay chunks attenuate skylight by
+/// one level per water block. Mixing those inputs draws a bright seabed ring
+/// at the near/far handoff, even after every LOD has finished loading.
+///
+/// Runs are bottom-up. Only the continuous, sky-exposed water stack and the
+/// touching floor are affected; roofs, ice, air pockets, lava and block light
+/// keep their input values. This also handles water represented by kelp or
+/// seagrass states, which the bridge classifies as material::WATER.
+pub fn shade_open_water(runs: &mut [SampledRun], blocks: &BlockTable) {
+    let Some(top) = runs.iter().rposition(|r| !blocks.get(r.state).air) else { return; };
+    if blocks.get(runs[top].state).material != material::WATER {
+        return;
+    }
+    let surface = runs[top].max;
+    let mut bottom = surface;
+    for run in runs[..=top].iter_mut().rev() {
+        if run.max != bottom || run.min >= run.max || blocks.get(run.state).air {
+            break;
+        }
+        run.sky = (15 - surface.saturating_sub(run.max)).clamp(0, 15) as u8;
+        if blocks.get(run.state).material != material::WATER {
+            break;
+        }
+        bottom = run.min;
+    }
 }
 
 /// The world generator, as far terrain samples it: one column at a time,
