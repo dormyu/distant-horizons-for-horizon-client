@@ -1,5 +1,41 @@
 # dormyu adaptation for RustCore / DormLab
 
+## Underwater handoff — 0.1.0+dormyu.18
+
+DH source `3a8aa870971a3213f8436fe8e299eb95d30b4c73` corrects the reproduced
+underwater transition without changing Immersive Landscapes 0.6.0 or Zoom 2 Rust.
+Runtime SHA256: `33992c7848f91b2a3a730c5e0d267edf57e188d2461ed152aa73129b651a2047`.
+See [validation-dormyu.18.md](docs/validation-dormyu.18.md) for scope and images.
+
+Water skylight now follows depth in sampled water and its adjoining floor.
+Capture retains raw kelp/seagrass states through generated, saved and native
+summary paths. At width 1 in the existing Medium-or-higher handoff ring, plants
+use native geometry, texture coordinates, ambient occlusion and light, with the
+same resident-chunk cutout as far terrain. Derived caches/summary revisions
+rebuild; saved chunks, edits and IL world recipes stay unchanged.
+
+The full client, fresh capture hooks, aquatic models and native water-light
+fixtures passed against the final client library. Earlier standalone checks
+passed 70 tests and Clippy. Five native 16 → 8 → 16 / DH 64 captures and a
+full-process reopen were reviewed: the original pale strip is absent there.
+All five additional native 32 → 16 → 32 / DH 128 captures also retain aquatic
+detail across the former bare strip. The two-client functional check passed.
+Installation and actual Prism verification have separate delivery records;
+these native checks do not substitute for them.
+
+A separate distant blue/turquoise line remains visible. Four pixel pairs map
+to deep lukewarm ocean and warm ocean surface data with different water colors;
+the debug view distinguishes it from the native/DH and width1/2 boundaries.
+This biome-tint transition currently has narrow blending and is not claimed fixed.
+
+Current visual scope is vanilla Overworld smooth lighting without shaders.
+Coarser detail remains approximate; other scenes and modes are not certified.
+Performance tests were waived, and owner aesthetic approval remains separate.
+Original DH/Rust-port authors, LGPL/GPL notices and Horizon/tooling MIT notices
+remain unchanged. This is dormyu's adaptation, not an upstream release.
+
+The entries below are historical and retain their original validation scope.
+
 ## Verified renderer changes — 0.1.0+dormyu.17
 
 <!-- DH17-SELECTED-RENDERER-QA -->

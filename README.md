@@ -1,16 +1,33 @@
 # Distant Horizons for Horizon Client — dormyu adaptation
 
 Native Rust level-of-detail terrain for **Horizon f42ef42 / Minecraft 26.3**.
-This repository maintains dormyu's adaptation of Deniz Şahin's Rust
-port of Distant Horizons. Version **0.1.0+dormyu.17** adds supported narrow far-tree stems,
-water-tint edge blending and bounded planner/tint optimizations.
+This repository maintains dormyu's adaptation of Deniz Şahin's Rust port of
+Distant Horizons. Version **0.1.0+dormyu.18** corrects underwater skylight and
+keeps aquatic plants visible where native chunks hand over to the nearest DH
+detail level. The reproduced pale diagonal strip is absent in the reviewed
+native 16 → 8 → 16 / DH 64 scene, its full-process reopen and the additional
+native 32 → 16 → 32 / DH 128 sequence.
 
-The checked native set combines this renderer with Immersive Landscapes 0.6.0 and
-official Zoom 2. Read [current validation](docs/validation-dormyu.17.md) for exact
-source and runtime hashes, test hardware, functional checks, reviewed scenes and
-remaining LOD limits. Performance tests were omitted at the owner's request.
+The checked native set includes unchanged Immersive Landscapes 0.6.0 and official
+Zoom 2. [Validation and limits](docs/validation-dormyu.18.md) distinguish the
+completed checks from the remaining work. Two Rust clients passed the functional
+check. Installation and Prism read-back are recorded separately from these
+native runtime checks.
+Performance tests were omitted at the owner's request.
 
-![Original canopy camera at native 16 / DH 64, after DH preparation and notification fade](docs/images/dormyu.17/delta-canopy.png)
+![Reviewed native 8 / DH 64 view after terrain preparation; aquatic vegetation remains across the former pale strip](docs/images/dormyu.18/near8-settled.png)
+
+## What changed
+
+Water depth now attenuates skylight in sampled water and the adjoining floor.
+Raw kelp and seagrass states survive capture instead of becoming plantless water.
+At width 1 in the existing Medium-or-higher handoff ring, plants use native model
+geometry, texture coordinates, ambient occlusion and lighting, with the same
+resident-chunk mask as the surrounding far terrain.
+
+This update rebuilds derived DH/generated-column caches on first use. Saved
+Minecraft chunks, player edits and IL recipes stay unchanged; a new world is not
+required. Cache rebuilding and further exploration still require preparation.
 
 ## What is distributed
 
@@ -55,19 +72,17 @@ historical documentation, including upstream instructions for older engine pins.
 
 Options → Mods → Distant Horizons controls LOD distance, quality and generation.
 `/dh status`, `/dh on`, `/dh off` and `/dh save` expose renderer state. Keep Horizon's
-independent native LOD renderer disabled when DH owns the distant view. The tested
-visual profile uses native 16 → 8 → 16, DH 64 Medium, 1920 × 1080 and a 30 FPS cap.
-The owner's installed native 32 / DH 128 preferences remain unchanged. The cap is
-a test setting; this release provides no new FPS measurements or 120 FPS guarantee.
+independent native LOD renderer disabled when DH owns the distant view.
+The owner's native 32 / DH 128 preferences remain the delivery target.
 
-The DHH2 cache version rebuilds derived DH data on first use after this update.
-Existing Minecraft chunks, player edits and saved IL recipes are unchanged; this
-renderer update does not require a new world. Preparing the new cache takes time.
-The validation report records remaining terrain, vegetation, lighting and water
-transitions in the reviewed scenes. Owner aesthetic approval remains separate.
-
-See the [reviewed delta scenes and native-distance transitions](docs/validation-dormyu.17.md#manual-visual-review-and-remaining-limits)
-in the validation gallery.
+The reviewed scenes use DH 64/128 Medium, native 16 → 8 → 16 and 32 → 16 → 32,
+smooth lighting and no shader pack in the Overworld. A distant blue/turquoise
+boundary remains visible: surface biome data confirms the different water colors
+of deep lukewarm ocean and warm ocean. Its current blending is narrow; it is
+separate from the former bare underwater strip. More distant LOD levels still
+simplify seabed and vegetation detail. Other lighting/shader modes and all scenes or seeds are not
+certified. There are no new performance measurements or owner aesthetic approval.
+See the [before/after gallery and remaining checks](docs/validation-dormyu.18.md).
 
 ## Credits and licenses
 
