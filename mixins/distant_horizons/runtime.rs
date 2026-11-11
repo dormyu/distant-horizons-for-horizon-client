@@ -2395,6 +2395,9 @@ pub struct MeshNeighborhood<'a> {
     pub neighbors: [Option<&'a FullDataSource>; 8],
     /// Selected, potentially touching coarser tiles, ordered coarsest first.
     pub coarser: &'a [TintNeighborhood<'a>],
+    /// The same resident-chunk mask as the terrain quads. Model overlays must
+    /// retire with their water column, including incomplete near loading.
+    pub cutout: &'a dyn Fn(i32, i32) -> bool,
 }
 
 pub trait Host: Send + Sync + 'static {
@@ -3617,6 +3620,7 @@ pub mod engine {
         let mesh = (!quads.is_empty()).then(|| shared.host.mesh_with_neighbors(
             s, &source, &quads, settings.debug, MeshNeighborhood {
                 neighbors: neighbors.each_ref().map(|n| n.as_deref()), coarser: &coarser,
+                cutout: &cutout,
             },
         ));
         let quad_count = mesh.as_ref().map_or(0, |mesh| shared.host.mesh_quad_count(mesh, quads.len()));

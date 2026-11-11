@@ -30,6 +30,95 @@ name = "distant_horizons_water_tint"
 source = "water_tint.rs"
 
 [[module]]
+id = "aquatic_models"
+file = "crates/horizon-client/src/game.rs"
+name = "distant_horizons_aquatic_models"
+source = "aquatic_models.rs"
+
+[[module]]
+id = "aquatic_lighting"
+file = "crates/horizon-client-render/src/mesher.rs"
+name = "distant_horizons_aquatic_lighting"
+source = "aquatic_lighting.rs"
+visibility = "pub"
+
+[[module]]
+id = "aquatic_columns"
+file = "crates/horizon-client-render/src/lod.rs"
+name = "distant_horizons_aquatic_columns"
+source = "aquatic_columns.rs"
+visibility = "pub"
+
+[[injection]]
+id = "aquatic_generated"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client_lib::vanillagen::lod::columns"
+helper = "aquatic_generated.rs"
+bindings = [
+  { name = "chunk", ty = "&horizon_world::worldgen::generator::ProtoChunk", value = "chunk" },
+  { name = "biome_map", ty = "&[u16]", value = "biome_map" },
+  { name = "dimension", ty = "&str", value = "dimension" },
+]
+
+[[injection]]
+id = "aquatic_saved"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client_lib::save::decode_lod_surfaces"
+helper = "aquatic_saved.rs"
+bindings = [
+  { name = "root", ty = "&horizon_world::nbt::NamedTag", value = "root" },
+  { name = "assets", ty = "&crate::assets::Assets", value = "assets" },
+  { name = "biomes", ty = "&crate::biome::Biomes", value = "biomes" },
+  { name = "layout", ty = "crate::chunk::ColumnLayout", value = "layout" },
+  { name = "sky_light", ty = "bool", value = "sky_light" },
+]
+
+[[injection]]
+id = "aquatic_kinds"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client_render::lod::state_kinds"
+helper = "aquatic_kinds.rs"
+bindings = [
+  { name = "facts", ty = "&crate::blocks::BlockFacts", value = "facts" },
+]
+
+[[injection]]
+id = "aquatic_cache_key"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client_render::lod::cache::build_key"
+helper = "aquatic_cache_key.rs"
+bindings = [
+  { name = "states", ty = "usize", value = "states" },
+  { name = "biomes", ty = "usize", value = "biomes" },
+]
+
+[[injection]]
+id = "aquatic_summary_encode"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client_render::server_terrain::encode"
+helper = "aquatic_summary_encode.rs"
+bindings = [
+  { name = "x", ty = "i32", value = "x" },
+  { name = "z", ty = "i32", value = "z" },
+  { name = "columns", ty = "&[crate::lod::Column; 256]", value = "columns" },
+]
+
+[[injection]]
+id = "aquatic_summary_decode"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client_render::server_terrain::decode"
+helper = "aquatic_summary_decode.rs"
+bindings = [
+  { name = "tag", ty = "&horizon_world::nbt::Tag", value = "tag" },
+]
+
+[[module]]
 id = "stem_capture"
 file = "crates/horizon-client/src/client_lib.rs"
 name = "distant_horizons_stem_capture"

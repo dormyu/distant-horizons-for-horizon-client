@@ -8,6 +8,7 @@
 // Part of Distant Horizons for Horizon Client, LGPL-3.0 (see runtime.rs).
 
 use crate::game::Game;
+use crate::game::distant_horizons_aquatic_models as aquatic_models;
 use crate::game::distant_horizons_water_tint::{WaterTintGrid, WaterTintSource};
 use crate::game::distant_horizons::{
     self as dh, BlockInfo, BlockTable, ChunkView, ColumnSampler, DetailPlan, Dir, FullDataSource, Host, Quad,
@@ -39,8 +40,8 @@ const REREAD_EVERY: Duration = Duration::from_secs(5);
 /// The far-terrain upload budget per frame, as Horizon's own far terrain.
 const UPLOAD_BUDGET: Duration = Duration::from_millis(2);
 
-// These plants contain water even though their block is non-colliding. Far
-// terrain projects the fluid volume; detailed near chunks keep the plant mesh.
+// These plants contain water even though their block is non-colliding. Keep
+// the fluid volume AND their separate cutout model at the block-scale handoff.
 fn water_like(name: &str) -> bool {
     matches!(
         name.strip_prefix("minecraft:").unwrap_or(name),
@@ -112,7 +113,7 @@ fn fingerprint(facts: &horizon_client::blocks::BlockFacts) -> u64 {
     // Old partial preparation erased visited columns, and their reductions
     // may have propagated nonempty but incomplete coarse data. Rebuild only
     // derived LOD files; gameplay chunks and player edits stay intact.
-    "dormyu-water-skylight-v6-f42ef42".hash(&mut h);
+    "dormyu-aquatic-models-v7-f42ef42".hash(&mut h);
     for s in &facts.states {
         s.name.hash(&mut h);
     }
@@ -536,7 +537,9 @@ impl Host for HorizonHost {
         }))
     }
     fn mesh(&self, section: i64, source: &FullDataSource, quads: &[Quad], debug: bool) -> SectionMesh {
-        self.mesh_with_neighbors(section, source, quads, debug, MeshNeighborhood { neighbors: [None; 8], coarser: &[] })
+        self.mesh_with_neighbors(section, source, quads, debug, MeshNeighborhood {
+            neighbors: [None; 8], coarser: &[], cutout: &|_, _| false,
+        })
     }
     fn mesh_with_neighbors(
         &self,
@@ -630,6 +633,10 @@ impl Host for HorizonHost {
                     emit(&mut mesh, face, rect);
                 }
             }
+        }
+        if !debug {
+            aquatic_models::append(&mut mesh, source, &self.context, &self.blocks,
+                self.layout.min_y(), neighborhood.neighbors, neighborhood.cutout);
         }
         mesh.sort_solid();
         mesh

@@ -83,3 +83,27 @@ fn open_water_below_zero_uses_depth_not_absolute_height() {
     assert_eq!(runs[0].sky,11);
     assert_eq!(runs[1].sky,15);
 }
+
+#[test]
+fn retaining_aquatic_states_keeps_one_continuous_water_volume() {
+    let blocks=blocks();
+    let settings=RenderSettings{cave_culling:false,cave_culling_height:60,min_y:-64};
+    let mesh=|plant:bool,hidden:bool| {
+        let mut source=FullDataSource::empty(pos::encode(6,0,0));
+        for x in 0..3 {for z in 0..3 {
+            let runs=vec![run(-64,53,1,5),run(53,57,if plant&&x==1&&z==1 {3}else{2},9),run(57,63,2,15)];
+            let values=column_from_runs(&mut source.mapping,&runs,-64,320);
+            source.set_column(x,z,values,gen_step::FEATURES);
+        }}
+        let render=RenderSource::from_full(&source,&blocks,&settings);
+        build_quads(&render,[None;4],&settings,|x,z|hidden&&x==1&&z==1)
+    };
+    for hidden in [false,true] {
+        let plain=mesh(false,hidden);let planted=mesh(true,hidden);
+        let geometry=|quads:Vec<distant_horizons_for_horizon_client::Quad>|{
+            let mut q:Vec<_>=quads.into_iter().map(|q|(q.dir,q.plane,q.u0,q.v0,q.u1,q.v1,q.transparent,q.lower_top)).collect();
+            q.sort_unstable();q
+        };
+        assert_eq!(geometry(plain),geometry(planted),"plants add neither inner water walls nor holes; hidden={hidden}");
+    }
+}
